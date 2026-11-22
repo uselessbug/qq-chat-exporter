@@ -702,7 +702,16 @@ impl BatchMessageFetcher {
                     _ => false,
                 })
                 .count();
-            if unchanged_cursor || seq_increased || repeated_previous_id {
+            // QQ NT 本地库的 msgSeq 不是跨整个历史稳定单调的：
+            // 实机验证 seq=0 后可继续读到非零序号，且时间戳也可能回跳。
+            // 只以完整游标未前进或已读取的 msgId 重新出现作为阻断条件。
+            if seq_increased && !unchanged_cursor && !repeated_previous_id {
+                tracing::info!(
+                    "[QCE-LOCAL-HISTORY] nonmonotonic_seq peer={} prevSeq={} nextSeq={} prevTime={:?} nextTime={:?}（按三字段游标继续）",
+                    peer_uid, previous.msg_seq, current.msg_seq, previous_time, current_time
+                );
+            }
+            if unchanged_cursor || repeated_previous_id {
                 tracing::warn!(
                     "[QCE-LOCAL-HISTORY] cursor_anomaly peer={} prevId={} prevTime={} prevSeq={} nextId={} nextTime={} nextSeq={} firstId={:?} firstSeq={:?} firstTime={:?} lastId={:?} lastSeq={:?} lastTime={:?} count={} unchangedCursor={} seqIncreased={} repeatedPreviousId={} repeatedPositions={:?} seqOrderIncreases={} prevTimeParsed={:?} nextTimeParsed={:?}",
                     peer_uid,
@@ -2524,6 +2533,8 @@ mod tests {
         scripted_seq: Mutex<VecDeque<Result<Value, String>>>,
         /// get_msg_history 只返回游标自身（模拟游标不前进）。
         stall_history: bool,
+        /// 让本地分页错误地重复返回游标本身。
+        stall_local_history: bool,
         /// 把每个接口的 msgList 反转返回。
         ///
         /// NapCat TS 层只是透传 `NodeIKernelMsgService`，源码没有记载
@@ -2569,12 +2580,18 @@ mod tests {
                 calls: Mutex::new(Vec::new()),
                 scripted_seq: Mutex::new(VecDeque::new()),
                 stall_history: false,
+                stall_local_history: false,
                 reverse_output: false,
             }
         }
 
         fn with_stall_history(mut self) -> Self {
             self.stall_history = true;
+            self
+        }
+
+        fn with_stalled_local_history(mut self) -> Self {
+            self.stall_local_history = true;
             self
         }
 
@@ -2662,6 +2679,10 @@ mod tests {
             self.calls.lock().unwrap().push(format!(
                 "local:{msg_id}:{msg_seq}:{include_current}:{count}"
             ));
+            if self.stall_local_history && msg_id != "0" {
+                let pos = *self.positions.get(msg_id).ok_or("unknown local msgId")?;
+                return Ok(json!({"result": 0, "msgList": [self.records[pos].clone()]}));
+            }
             let start = if msg_id != "0" {
                 let pos = *self.positions.get(msg_id).ok_or("unknown local msgId")?;
                 pos + usize::from(!include_current)
@@ -3092,6 +3113,87 @@ mod tests {
         assert_eq!(calls.iter().filter(|call| call.starts_with("seq:")).count(), 1);
         assert!(calls.iter().any(|call| call == "local:0:7:true:5"));
         assert!(calls.iter().any(|call| call == "local:m3:3:false:5"));
+    }
+
+    /// 实机回归：序号 0 的最后一条后，QQ NT 继续返回较大的正序号，
+    /// 且时间戳有时也会增大，三字段游标仍能正常翻页。
+    #[tokio::test]
+    async fn local_history_zero_seq_transition_allows_nonmonotonic_seq_and_time() {
+        let entries = vec![
+            ("z0".to_string(), 0, 1_632_155_183_000),
+            ("p3".to_string(), 2_306_856, 1_632_898_724_000),
+            ("p2".to_string(), 2_306_855, 1_632_898_700_000),
+            ("p1".to_string(), 2_306_854, 1_632_898_680_000),
+        ];
+        let mut mock = SeqBoundaryMock::new(entries);
+        // 此场景按 QQ NT 返回的历史顺序组织，而非 msgSeq 排序。
+        mock.records.sort_by_key(|m| match message_msg_id(m).as_deref() {
+            Some("z0") => 0,
+            Some("p3") => 1,
+            Some("p2") => 2,
+            _ => 3,
+        });
+        mock.positions = mock.records.iter().enumerate()
+            .filter_map(|(i, m)| message_msg_id(m).map(|id| (id, i)))
+            .collect();
+        let api = Arc::new(mock);
+        let fetcher = BatchMessageFetcher::new(
+            Arc::clone(&api) as Arc<dyn MessageFetchApi>,
+            boundary_fetcher_config(),
+        );
+        let previous = BatchFetchResult {
+            has_more: true,
+            local_cursor: Some(LocalHistoryCursor {
+                msg_id: "z0".to_string(),
+                msg_time: "1632155183".to_string(),
+                msg_seq: "0".to_string(),
+            }),
+            next_message_id: Some("z0".to_string()),
+            next_seq: Some("0".to_string()),
+            ..BatchFetchResult::default()
+        };
+        let batch = fetcher
+            .fetch_next_batch(&group_peer(), &MessageFilter::default(), Some(&previous))
+            .await
+            .expect("合法的序列号增大不应触发游标错误")
+            .expect("应有后续消息");
+        let ids: Vec<String> = batch.messages.iter().filter_map(message_msg_id).collect();
+        assert_eq!(ids, ["p3", "p2", "p1"]);
+        assert_eq!(batch.next_seq.as_deref(), Some("2306854"));
+        assert!(api.call_log().iter().any(|c| c == "local:z0:0:false:5"));
+        let following = fetcher
+            .fetch_next_batch(&group_peer(), &MessageFilter::default(), Some(&batch))
+            .await
+            .expect("历史终点应返回空页而非重读 seq=0");
+        assert!(following.is_none());
+    }
+
+    /// 同一条边界记录被再次返回时仍然拒绝，防止循环与重复导出。
+    #[tokio::test]
+    async fn local_history_repeated_previous_id_still_fails() {
+        let api = Arc::new(SeqBoundaryMock::new(vec![
+            ("a".to_string(), 9, 9_000),
+            ("b".to_string(), 8, 8_000),
+        ]).with_stalled_local_history());
+        let fetcher = BatchMessageFetcher::new(
+            Arc::clone(&api) as Arc<dyn MessageFetchApi>,
+            boundary_fetcher_config(),
+        );
+        let previous = BatchFetchResult {
+            has_more: true,
+            local_cursor: Some(LocalHistoryCursor {
+                msg_id: "a".to_string(),
+                msg_time: "9".to_string(),
+                msg_seq: "9".to_string(),
+            }),
+            ..BatchFetchResult::default()
+        };
+        let error = fetcher
+            .fetch_next_batch(&group_peer(), &MessageFilter::default(), Some(&previous))
+            .await
+            .expect_err("本地查询重复返回上一页游标自身时必须拒绝");
+        assert!(error.to_string().contains("unchangedCursor=true"));
+
     }
 
     /// 即使 #716 边界补读遭到 2004010，仍能从本地库读取完整记录。
