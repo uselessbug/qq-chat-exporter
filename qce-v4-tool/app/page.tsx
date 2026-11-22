@@ -2053,7 +2053,7 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
                               </Badge>
                             )}
                             {task.historyPartial && (
-                              <Badge className="border-0 bg-amber-500/10 px-1.5 py-0 text-[11px] text-amber-700 dark:text-amber-300" title="检测到历史分页循环，结果可能不完整">
+                              <Badge className="border-0 bg-amber-500/10 px-1.5 py-0 text-[11px] text-amber-700 dark:text-amber-300" title="本地历史分页异常终止，完整性未核验；原因见任务消息">
                                 部分导出 · 历史未核验
                               </Badge>
                             )}
@@ -2209,7 +2209,7 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
                             <span className="font-mono">{formatTaskPeerLabel(task.peer)}</span>
                           )}
                           {task.historyPartial && (
-                            <Badge className="border-0 bg-amber-500/10 px-1.5 py-0 text-[11px] text-amber-700 dark:text-amber-300" title="检测到历史分页循环，结果可能不完整">
+                            <Badge className="border-0 bg-amber-500/10 px-1.5 py-0 text-[11px] text-amber-700 dark:text-amber-300" title="本地历史分页异常终止，完整性未核验；原因见任务消息">
                               部分导出 · 历史未核验
                             </Badge>
                           )}

@@ -69,6 +69,17 @@ const SEEK_NEIGHBOR_RETRIES: u32 = 3;
 /// 邻近探测点的步长（一个序列页宽度）。
 const SEEK_NEIGHBOR_STEP: i64 = GROUP_SEQ_PAGE_MAX;
 
+/// 本地历史 seq=0 尾段收尾：每次重查时 pageLimit 的放大倍数。
+const LOCAL_TAIL_LIMIT_GROWTH: i64 = 4;
+
+/// 本地历史 seq=0 尾段收尾的请求上限。pageLimit 依次为页大小的 1 / 4 / 16 倍
+/// （默认 500 / 2000 / 8000），仍取不完说明尾段异常庞大，停止并标记未核验，
+/// 不把超大窗口压给 QQ 原生 Worker（issue #634）。
+const LOCAL_TAIL_MAX_REQUESTS: u32 = 3;
+
+/// 本地历史 seq=0 尾段收尾的总耗时上限；超过后不再发起新的尾段查询。
+const LOCAL_TAIL_MAX_ELAPSED_MS: u64 = 3 * 60 * 1000;
+
 /// issue #634：进程级历史查询门控。同一时刻只允许一个重量级历史消息查询
 /// 进入 NapCat Worker，防止并发/叠加查询压垮 QQ 原生模块。
 fn history_fetch_gate() -> &'static Semaphore {
@@ -170,6 +181,99 @@ pub struct LocalHistoryCursor {
     msg_seq: String,
 }
 
+impl LocalHistoryCursor {
+    /// 从原始消息读取三字段游标。
+    fn from_message(msg: &Value) -> Result<Self, FetchError> {
+        Ok(Self {
+            msg_id: message_msg_id(msg)
+                .ok_or_else(|| FetchError::Api("本地消息缺少 msgId".to_string()))?,
+            msg_time: loose_msg_time(msg)
+                .ok_or_else(|| FetchError::Api("本地消息缺少 msgTime".to_string()))?
+                .to_string(),
+            msg_seq: loose_msg_seq(msg)
+                .ok_or_else(|| FetchError::Api("本地消息缺少 msgSeq".to_string()))?
+                .to_string(),
+        })
+    }
+}
+
+/// 一次 `queryMsgsWithFilterEx` 请求的起点。
+///
+/// 实机日志（群 960251923，1423 个不同请求）还原出的内核行为：
+/// - `msgSeq != 0`：返回 `msgSeq < 游标 msgSeq` 的记录，按 msgSeq 降序；
+///   全部 `msgSeq = 0` 的记录排在最后，彼此按 msgTime 降序。
+/// - `msgSeq = 0` 且带 msgId：内核改按 `msgId < 游标 msgId` 过滤。迁移导入的
+///   历史 msgId 与时间无关，结果会跳回已遍历过的区间并周期性重复。
+///
+/// 因此起点只能是非零 msgSeq 的游标或「从最新开始」的全零游标，
+/// 绝不能把 seq=0 的消息当作游标继续翻页。
+#[derive(Debug, Clone)]
+struct LocalHistoryQuery {
+    msg_id: String,
+    msg_time: String,
+    msg_seq: String,
+    include_current: bool,
+}
+
+impl LocalHistoryQuery {
+    /// 从上一页末尾的游标继续（不含游标自身）。
+    fn after(cursor: &LocalHistoryCursor) -> Self {
+        Self {
+            msg_id: cursor.msg_id.clone(),
+            msg_time: cursor.msg_time.clone(),
+            msg_seq: cursor.msg_seq.clone(),
+            include_current: false,
+        }
+    }
+
+    /// 从指定序号（含）开始；`"0"` 表示从最新消息开始。
+    fn from_seq(msg_seq: String) -> Self {
+        Self {
+            msg_id: "0".to_string(),
+            msg_time: "0".to_string(),
+            msg_seq,
+            include_current: true,
+        }
+    }
+}
+
+/// 本地历史分页无法核验完整性的原因。
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LocalHistoryIssue {
+    /// 游标没有前进，或上一页的边界消息被再次返回。
+    #[error("分页游标未前进")]
+    CursorStalled,
+    /// 从非零 msgSeq 游标翻页后出现了更大的 msgSeq。
+    #[error("翻页后消息序号反向增大")]
+    SeqWentUp,
+    /// 之前某一页的页尾边界再次出现。
+    #[error("分页结果重复")]
+    RepeatedPage,
+    /// 放大 pageLimit 后返回条数没有增加，无法判断 seq=0 尾段是否取完。
+    #[error("内核限制了单页条数，无法确认序号为 0 的尾段消息已取完")]
+    TailPageLimitCapped,
+    /// seq=0 尾段在请求数 / 耗时预算内没有取完。
+    #[error("序号为 0 的尾段消息过多，未在查询预算内取完")]
+    TailBudgetExhausted,
+    /// 从非零游标重查尾段时混入了非零序号的记录。
+    #[error("序号为 0 的尾段消息重查结果异常")]
+    TailNotAtEnd,
+    /// 尾段查询失败。
+    #[error("序号为 0 的尾段消息查询失败: {0}")]
+    TailQueryFailed(String),
+}
+
+/// 本地历史回退分页的终止状态。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalHistoryEnd {
+    /// 内核返回空页或短页：本地可枚举的历史已全部读完。
+    Complete,
+    /// 已回溯到请求的起始时间之前；更早的记录与 seq=0 尾段没有扫描。
+    ReachedStartTime,
+    /// 分页异常终止：已抓取的记录全部保留，但完整性未核验。
+    Unverified(LocalHistoryIssue),
+}
+
 /// 批量获取结果。
 #[derive(Debug, Clone, Default)]
 pub struct BatchFetchResult {
@@ -183,8 +287,6 @@ pub struct BatchFetchResult {
     pub next_seq: Option<String>,
     /// 本地数据库分页游标；仅 queryMsgsWithFilterEx 回退模式使用。
     pub local_cursor: Option<LocalHistoryCursor>,
-    /// 本地历史回退路径检测到跨页循环；输出仍需显式标记可能不完整。
-    pub local_cycle_detected: bool,
     /// 客户端筛选后的实际条数。
     pub actual_count: usize,
     /// 本次获取耗时（毫秒）。
@@ -388,8 +490,10 @@ struct FetcherState {
     consecutive_successes: u32,
     stats: ApiCallStats,
     current_strategy: FetchStrategy,
-    /// 只保留每页末尾的精确游标，内存规模按页数而非消息数增长。
-    seen_local_page_ends: HashSet<LocalHistoryCursor>,
+    /// 只保留每页末尾记录的 msgId，内存规模按页数而非消息数增长。
+    seen_local_page_ends: HashSet<String>,
+    /// 本地历史回退分页的终止状态；未进入回退或尚未结束时为 `None`。
+    local_history_end: Option<LocalHistoryEnd>,
 }
 
 /// 批量消息获取器。
@@ -414,6 +518,7 @@ impl BatchMessageFetcher {
                 stats: ApiCallStats::default(),
                 current_strategy: FetchStrategy::Hybrid,
                 seen_local_page_ends: HashSet::new(),
+                local_history_end: None,
             }),
             is_fetching: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
@@ -456,6 +561,14 @@ impl BatchMessageFetcher {
     /// 重置统计信息。
     pub async fn reset_stats(&self) {
         self.state.lock().await.stats = ApiCallStats::default();
+    }
+
+    /// 本地历史回退分页的终止状态。
+    ///
+    /// 分页循环结束后读取：`None` 表示本次抓取没有进入本地回退（或被取消），
+    /// 其余取值区分已核验的完整终止、按时间范围停止与未核验的异常终止。
+    pub async fn local_history_end(&self) -> Option<LocalHistoryEnd> {
+        self.state.lock().await.local_history_end.clone()
     }
 
     /// 批量获取消息（主要外部接口，支持筛选与分页）。
@@ -525,7 +638,9 @@ impl BatchMessageFetcher {
             None => {
                 // 抓取序列起点重置取消标记（issue #446）。
                 self.reset_cancel_token();
-                self.state.lock().await.seen_local_page_ends.clear();
+                let mut state = self.state.lock().await;
+                state.seen_local_page_ends.clear();
+                state.local_history_end = None;
             }
             Some(prev) => {
                 if !prev.has_more || self.is_cancelled() {
@@ -586,6 +701,9 @@ impl BatchMessageFetcher {
 
     /// 已退群/封禁群的本地消息分页。原生页完成后使用 next_seq 衔接，
     /// 此后使用 (msgId,msgTime,msgSeq) 精确游标，避免同 seq 记录丢失。
+    ///
+    /// 翻页与终止规则见 [`LocalHistoryQuery`]：页尾落在 seq=0 尾段时不再把它
+    /// 当作游标，而是由 [`Self::complete_zero_seq_tail`] 从非零序号的锚点取完尾段。
     async fn fetch_local_group_page(
         &self,
         peer: &Peer,
@@ -593,230 +711,314 @@ impl BatchMessageFetcher {
         previous: Option<&BatchFetchResult>,
     ) -> Result<BatchFetchResult, FetchError> {
         let previous_cursor = previous.and_then(|batch| batch.local_cursor.clone());
-        let (msg_id, msg_time, msg_seq, include_current) = match &previous_cursor {
-            Some(cursor) => (
-                cursor.msg_id.clone(),
-                cursor.msg_time.clone(),
-                cursor.msg_seq.clone(),
-                false,
-            ),
-            None => (
-                "0".to_string(),
-                "0".to_string(),
-                previous
-                    .and_then(|batch| batch.next_seq.clone())
-                    .unwrap_or_else(|| "0".to_string()),
-                true,
-            ),
-        };
-
-        // 诊断只记录会话标识和分页游标，不输出消息正文或 elements。
-        tracing::info!(
-            "[QCE-LOCAL-HISTORY] request peer={} msgId={} msgTime={} msgSeq={} includeCurrent={}",
-            peer.peer_uid,
-            msg_id,
-            msg_time,
-            msg_seq,
-            include_current
+        let query = previous_cursor.as_ref().map_or_else(
+            || {
+                LocalHistoryQuery::from_seq(
+                    previous
+                        .and_then(|batch| batch.next_seq.clone())
+                        .unwrap_or_else(|| "0".to_string()),
+                )
+            },
+            LocalHistoryQuery::after,
         );
         let started = now_ms();
-        let api = Arc::clone(&self.api);
-        let peer_uid = peer.peer_uid.clone();
-        let peer = peer.clone();
-        let raw_messages = self
-            .call_with_retry(move |batch_size| {
-                let api = Arc::clone(&api);
-                let peer = peer.clone();
-                let msg_id = msg_id.clone();
-                let msg_time = msg_time.clone();
-                let msg_seq = msg_seq.clone();
-                async move {
-                    let value = api
-                        .get_local_history(
-                            &peer,
-                            &msg_id,
-                            &msg_time,
-                            &msg_seq,
-                            include_current,
-                            seq_page_size(batch_size),
-                        )
-                        .await?;
-                    if is_history_exhausted_result(&value) {
-                        Ok(Vec::new())
-                    } else {
-                        extract_msg_page_strict(&value)
-                    }
-                }
-            })
-            .await?;
+        let (mut raw_messages, page_limit) = self.query_local_page(peer, &query, None).await?;
 
         // 必须从原始消息取游标，不能从筛选后的消息取（否则会跳过记录）。
+        let page_end = raw_messages
+            .last()
+            .map(LocalHistoryCursor::from_message)
+            .transpose()?;
+        let mut next_cursor = None;
+        let mut end = None;
+        match page_end {
+            None => end = Some(LocalHistoryEnd::Complete),
+            Some(page_end) => {
+                if let Some(issue) = self
+                    .check_local_page(peer, &query, previous_cursor.as_ref(), &raw_messages)
+                    .await
+                {
+                    // 不丢弃当前页，解析阶段已有跨块 msgId 去重，避免漏掉混入的新记录。
+                    end = Some(LocalHistoryEnd::Unverified(issue));
+                } else if page_end.msg_seq != "0" {
+                    next_cursor = Some(page_end);
+                } else if (raw_messages.len() as i64) < page_limit {
+                    // 短页以 seq=0 结尾：尾段已随本页取完。
+                    end = Some(LocalHistoryEnd::Complete);
+                } else {
+                    end = Some(
+                        self.complete_zero_seq_tail(peer, &query, page_limit, &mut raw_messages)
+                            .await?,
+                    );
+                }
+            }
+        }
+
         let earliest_msg_time = raw_messages
             .iter()
             .filter_map(loose_msg_time)
             .min()
             .map(to_millis);
-        let cursor = raw_messages
-            .last()
-            .map(|last| {
-                Ok(LocalHistoryCursor {
-                    msg_id: message_msg_id(last)
-                        .ok_or_else(|| FetchError::Api("本地消息缺少 msgId".to_string()))?,
-                    msg_time: loose_msg_time(last)
-                        .ok_or_else(|| FetchError::Api("本地消息缺少 msgTime".to_string()))?
-                        .to_string(),
-                    msg_seq: loose_msg_seq(last)
-                        .ok_or_else(|| FetchError::Api("本地消息缺少 msgSeq".to_string()))?
-                        .to_string(),
-                })
+        if let (Some(earliest), Some(start_time)) = (earliest_msg_time, filter.start_time) {
+            if earliest < start_time && next_cursor.take().is_some() {
+                end = Some(LocalHistoryEnd::ReachedStartTime);
+            }
+        }
+
+        {
+            let mut state = self.state.lock().await;
+            if let Some(next) = &next_cursor {
+                state.seen_local_page_ends.insert(next.msg_id.clone());
+            }
+            if end.is_some() {
+                state.local_history_end.clone_from(&end);
+            }
+        }
+        match &end {
+            Some(LocalHistoryEnd::Unverified(issue)) => tracing::warn!(
+                "[QCE-LOCAL-HISTORY] history_end peer={} status=unverified reason={issue:?}；停止翻页，保留已抓取记录，完整性待核验",
+                peer.peer_uid
+            ),
+            Some(end) => tracing::info!(
+                "[QCE-LOCAL-HISTORY] history_end peer={} status={end:?}",
+                peer.peer_uid
+            ),
+            None => {}
+        }
+
+        let has_more = next_cursor.is_some();
+        let messages = apply_client_side_filter(raw_messages, filter);
+        let actual_count = messages.len();
+        tracing::info!(
+            "[BatchMessageFetcher] 本地历史查询获取 {actual_count} 条消息, nextSeq={:?}, hasMore={has_more}",
+            next_cursor.as_ref().map(|c| &c.msg_seq)
+        );
+        Ok(BatchFetchResult {
+            messages,
+            has_more,
+            next_message_id: next_cursor.as_ref().map(|c| c.msg_id.clone()),
+            next_seq: next_cursor.as_ref().map(|c| c.msg_seq.clone()),
+            local_cursor: next_cursor,
+            actual_count,
+            fetch_time_ms: now_ms() - started,
+            earliest_msg_time,
+        })
+    }
+
+    /// 发起一次本地历史查询，返回原始消息与实际使用的 pageLimit。
+    ///
+    /// `page_limit` 为 `None` 时跟随自适应 batchSize（重试缩小后可能小于上一页），
+    /// 判断短页必须用这里返回的实际值。
+    async fn query_local_page(
+        &self,
+        peer: &Peer,
+        query: &LocalHistoryQuery,
+        page_limit: Option<i64>,
+    ) -> Result<(Vec<Value>, i64), FetchError> {
+        // 诊断只记录会话标识和分页游标，不输出消息正文或 elements。
+        tracing::info!(
+            "[QCE-LOCAL-HISTORY] request peer={} msgId={} msgTime={} msgSeq={} includeCurrent={}",
+            peer.peer_uid,
+            query.msg_id,
+            query.msg_time,
+            query.msg_seq,
+            query.include_current
+        );
+        let api = Arc::clone(&self.api);
+        let call_peer = peer.clone();
+        let call_query = query.clone();
+        let (messages, used_limit) = self
+            .call_with_retry(move |batch_size| {
+                let api = Arc::clone(&api);
+                let peer = call_peer.clone();
+                let query = call_query.clone();
+                async move {
+                    let limit = page_limit.unwrap_or_else(|| seq_page_size(batch_size));
+                    let value = api
+                        .get_local_history(
+                            &peer,
+                            &query.msg_id,
+                            &query.msg_time,
+                            &query.msg_seq,
+                            query.include_current,
+                            limit,
+                        )
+                        .await?;
+                    let messages = if is_history_exhausted_result(&value) {
+                        Vec::new()
+                    } else {
+                        extract_msg_page_strict(&value)?
+                    };
+                    Ok((messages, limit))
+                }
             })
-            .transpose()?;
+            .await?;
 
         // 简短分页摘要；在默认 info 日志级别可直接看到异常前一页。
-        let first = raw_messages.first();
-        let last = raw_messages.last();
+        let first = messages.first();
+        let last = messages.last();
         tracing::info!(
-            "[QCE-LOCAL-HISTORY] response count={} firstSeq={:?} firstTime={:?} lastSeq={:?} lastTime={:?}",
-            raw_messages.len(),
+            "[QCE-LOCAL-HISTORY] response count={} firstSeq={:?} firstTime={:?} lastSeq={:?} lastTime={:?} pageLimit={used_limit}",
+            messages.len(),
             first.and_then(loose_msg_seq),
             first.and_then(loose_msg_time),
             last.and_then(loose_msg_seq),
             last.and_then(loose_msg_time),
         );
+        Ok((messages, used_limit))
+    }
 
-        if let (Some(previous), Some(current)) = (&previous_cursor, &cursor) {
-            let previous_seq = previous.msg_seq.parse::<i64>().unwrap_or(i64::MAX);
-            let current_seq = current.msg_seq.parse::<i64>().unwrap_or(i64::MAX);
-            let previous_time = previous.msg_time.parse::<i64>().ok();
-            let current_time = current.msg_time.parse::<i64>().ok();
-            let unchanged_cursor = current == previous;
-            let seq_increased = current_seq > previous_seq;
-            let repeated_positions: Vec<usize> = raw_messages
+    /// 校验一页本地历史是否符合「从非零游标只会读到更旧序号」的分页模型。
+    ///
+    /// 返回 `Some` 时调用方停止翻页并把导出标记为未核验；本页记录照常保留。
+    /// 正常分页不会触发这里的任何一项，它们只用于拦截未知的内核行为。
+    async fn check_local_page(
+        &self,
+        peer: &Peer,
+        query: &LocalHistoryQuery,
+        previous: Option<&LocalHistoryCursor>,
+        messages: &[Value],
+    ) -> Option<LocalHistoryIssue> {
+        if let Some(previous) = previous {
+            let repeated_positions: Vec<usize> = messages
                 .iter()
                 .enumerate()
                 .filter_map(|(idx, msg)| {
-                    (message_msg_id(msg).as_deref() == Some(previous.msg_id.as_str()))
-                        .then_some(idx)
+                    (raw_msg_id(msg) == Some(previous.msg_id.as_str())).then_some(idx)
                 })
                 .collect();
-            let repeated_previous_id = !repeated_positions.is_empty();
-            // 统计页内是否出现序号逆向跳变；这不改变既有校验逻辑。
-            let seq_order_increases = raw_messages
-                .windows(2)
-                .filter(
-                    |pair| match (loose_msg_seq(&pair[0]), loose_msg_seq(&pair[1])) {
-                        (Some(a), Some(b)) => b > a,
-                        _ => false,
-                    },
-                )
-                .count();
-            // QQ NT 本地库的 msgSeq 不是跨整个历史稳定单调的：
-            // 实机验证 seq=0 后可继续读到非零序号，且时间戳也可能回跳。
-            // 只以完整游标未前进或已读取的 msgId 重新出现作为阻断条件。
-            if seq_increased && !unchanged_cursor && !repeated_previous_id {
-                tracing::info!(
-                    "[QCE-LOCAL-HISTORY] nonmonotonic_seq peer={} prevSeq={} nextSeq={} prevTime={:?} nextTime={:?}（按三字段游标继续）",
-                    peer_uid, previous.msg_seq, current.msg_seq, previous_time, current_time
-                );
-            }
-            if unchanged_cursor || repeated_previous_id {
+            if !repeated_positions.is_empty() {
                 tracing::warn!(
-                    "[QCE-LOCAL-HISTORY] cursor_anomaly peer={} prevId={} prevTime={} prevSeq={} nextId={} nextTime={} nextSeq={} firstId={:?} firstSeq={:?} firstTime={:?} lastId={:?} lastSeq={:?} lastTime={:?} count={} unchangedCursor={} seqIncreased={} repeatedPreviousId={} repeatedPositions={:?} seqOrderIncreases={} prevTimeParsed={:?} nextTimeParsed={:?}",
-                    peer_uid,
+                    "[QCE-LOCAL-HISTORY] cursor_anomaly peer={} prevId={} prevTime={} prevSeq={} count={} repeatedPositions={repeated_positions:?}",
+                    peer.peer_uid,
                     previous.msg_id,
                     previous.msg_time,
                     previous.msg_seq,
-                    current.msg_id,
-                    current.msg_time,
-                    current.msg_seq,
-                    first.and_then(message_msg_id),
-                    first.and_then(loose_msg_seq),
-                    first.and_then(loose_msg_time),
-                    last.and_then(message_msg_id),
-                    last.and_then(loose_msg_seq),
-                    last.and_then(loose_msg_time),
-                    raw_messages.len(),
-                    unchanged_cursor,
-                    seq_increased,
-                    repeated_previous_id,
-                    repeated_positions,
-                    seq_order_increases,
-                    previous_time,
-                    current_time,
+                    messages.len(),
                 );
-                // 错误本身也带上最小诊断字段，方便仅凭任务 UI 截图定位。
-                return Err(FetchError::Api(format!(
-                    "本地历史分页游标异常：unchangedCursor={unchanged_cursor}, seqIncreased={seq_increased}, repeatedPreviousId={repeated_previous_id}, repeatedPositions={repeated_positions:?}, prevSeq={}, nextSeq={}, prevTime={}, nextTime={}, count={}；详细字段请查看 qce-server.log",
-                    previous.msg_seq,
-                    current.msg_seq,
-                    previous.msg_time,
-                    current.msg_time,
-                    raw_messages.len()
-                )));
+                return Some(LocalHistoryIssue::CursorStalled);
             }
         }
 
-        // QQ NT 本地接口可能在 seq=0 附近跳回已遍历的历史区间。
-        // #4 允许合法的 seq 跳变；这里单独追踪“前面任何一页”真实到过的
-        // (msgId,msgTime,msgSeq) 边界。若它出现在新页中，说明不是单纯序号回跳，
-        // 而是数据已经重叠：立即终止分页，防止数千万条重复写入。
-        // 注意：不丢弃当前页，解析阶段已有跨块 msgId 去重，避免漏掉混入的新记录。
-        let (local_cycle_detected, visited_page_ends) = {
-            let mut state = self.state.lock().await;
-            let repeated = raw_messages.iter().enumerate().find_map(|(index, msg)| {
-                let candidate = LocalHistoryCursor {
-                    msg_id: message_msg_id(msg)?,
-                    msg_time: loose_msg_time(msg)?.to_string(),
-                    msg_seq: loose_msg_seq(msg)?.to_string(),
-                };
-                state
-                    .seen_local_page_ends
-                    .contains(&candidate)
-                    .then_some((index, candidate))
+        let query_seq = query.msg_seq.parse::<i64>().unwrap_or(0);
+        if query_seq > 0 {
+            let went_up = messages.iter().enumerate().find_map(|(index, msg)| {
+                loose_msg_seq(msg)
+                    .filter(|seq| *seq > query_seq)
+                    .map(|seq| (index, seq))
             });
-            if let Some(ref next) = cursor {
-                state.seen_local_page_ends.insert(next.clone());
+            if let Some((index, seq)) = went_up {
+                tracing::warn!(
+                    "[QCE-LOCAL-HISTORY] seq_went_up peer={} cursorSeq={query_seq} returnedSeq={seq} atIndex={index} returnedCount={}",
+                    peer.peer_uid,
+                    messages.len(),
+                );
+                return Some(LocalHistoryIssue::SeqWentUp);
             }
-            (repeated, state.seen_local_page_ends.len())
-        };
-        if let Some((index, repeated)) = &local_cycle_detected {
-            tracing::warn!(
-                "[QCE-LOCAL-HISTORY] history_cycle peer={} repeatedPageBoundaryId={} repeatedTime={} repeatedSeq={} repeatedAtIndex={} returnedCount={} visitedPages={}；停止翻页，保留已抓取记录，完整性待核验",
-                peer_uid,
-                repeated.msg_id,
-                repeated.msg_time,
-                repeated.msg_seq,
-                index,
-                raw_messages.len(),
-                visited_page_ends
-            );
         }
-        let local_cycle_detected = local_cycle_detected.is_some();
 
-        let mut has_more = cursor.is_some() && !local_cycle_detected;
-        if let (Some(earliest), Some(start_time)) = (earliest_msg_time, filter.start_time) {
-            if earliest < start_time {
-                has_more = false;
-            }
+        // 同一 msgSeq 下可有多条记录，序号校验拦不住在它们之间打转的游标；
+        // 这里追踪「前面任何一页」真实到过的页尾边界记录。
+        let state = self.state.lock().await;
+        let repeated = messages.iter().enumerate().find(|(_, msg)| {
+            raw_msg_id(msg).is_some_and(|id| state.seen_local_page_ends.contains(id))
+        });
+        if let Some((index, repeated)) = repeated {
+            tracing::warn!(
+                "[QCE-LOCAL-HISTORY] history_cycle peer={} repeatedPageBoundaryId={:?} repeatedTime={:?} repeatedSeq={:?} repeatedAtIndex={} returnedCount={} visitedPages={}",
+                peer.peer_uid,
+                raw_msg_id(repeated),
+                loose_msg_time(repeated),
+                loose_msg_seq(repeated),
+                index,
+                messages.len(),
+                state.seen_local_page_ends.len()
+            );
+            return Some(LocalHistoryIssue::RepeatedPage);
         }
-        let cursor = has_more.then_some(cursor).flatten();
-        let messages = apply_client_side_filter(raw_messages, filter);
-        let actual_count = messages.len();
-        tracing::info!(
-            "[BatchMessageFetcher] 本地历史查询获取 {actual_count} 条消息, nextSeq={:?}, hasMore={has_more}",
-            cursor.as_ref().map(|c| &c.msg_seq)
-        );
-        Ok(BatchFetchResult {
-            messages,
-            has_more,
-            next_message_id: cursor.as_ref().map(|c| c.msg_id.clone()),
-            next_seq: cursor.as_ref().map(|c| c.msg_seq.clone()),
-            local_cursor: cursor,
-            local_cycle_detected,
-            actual_count,
-            fetch_time_ms: now_ms() - started,
-            earliest_msg_time,
-        })
+        None
+    }
+
+    /// 取完 seq=0 尾段。
+    ///
+    /// `page` 是一张以 seq=0 结尾的满页：尾段可能还没取完，而 seq=0 的消息不能
+    /// 当游标。改为从页内最后一条非零序号的记录重查，内核会从尾段开头返回，
+    /// 条数小于 pageLimit 即证明尾段完整。尾段超过一页时逐次放大 pageLimit，
+    /// 请求数与耗时都有上限。新记录按 msgId 去重后追加到 `page`，已有记录不会
+    /// 被替换或丢弃。
+    async fn complete_zero_seq_tail(
+        &self,
+        peer: &Peer,
+        page_query: &LocalHistoryQuery,
+        page_limit: i64,
+        page: &mut Vec<Value>,
+    ) -> Result<LocalHistoryEnd, FetchError> {
+        let anchor_index = page
+            .iter()
+            .rposition(|msg| loose_msg_seq(msg).is_some_and(|seq| seq != 0));
+        let (anchor, mut limit, mut previous_count) = match anchor_index {
+            Some(index) => (
+                LocalHistoryQuery::after(&LocalHistoryCursor::from_message(&page[index])?),
+                page_limit,
+                None,
+            ),
+            // 整页都是 seq=0：沿用本页的请求起点，已知该起点下至少有一整页。
+            None => (
+                page_query.clone(),
+                page_limit * LOCAL_TAIL_LIMIT_GROWTH,
+                Some(page.len()),
+            ),
+        };
+        let mut seen: HashSet<String> = page.iter().map(message_dedupe_key).collect();
+        let started = tokio::time::Instant::now();
+        let budget = Duration::from_millis(LOCAL_TAIL_MAX_ELAPSED_MS);
+
+        for request in 1..=LOCAL_TAIL_MAX_REQUESTS {
+            if started.elapsed() > budget {
+                break;
+            }
+            let (tail, used_limit) = match self.query_local_page(peer, &anchor, Some(limit)).await {
+                Ok(tail) => tail,
+                Err(FetchError::Cancelled) => return Err(FetchError::Cancelled),
+                Err(error) => {
+                    return Ok(LocalHistoryEnd::Unverified(
+                        LocalHistoryIssue::TailQueryFailed(error.to_string()),
+                    ))
+                }
+            };
+            let returned = tail.len();
+            let stray = tail.iter().any(|msg| loose_msg_seq(msg) != Some(0));
+            let known = page.len();
+            for msg in tail {
+                if seen.insert(message_dedupe_key(&msg)) {
+                    page.push(msg);
+                }
+            }
+            tracing::info!(
+                "[QCE-LOCAL-HISTORY] zero_seq_tail peer={} request={request}/{LOCAL_TAIL_MAX_REQUESTS} anchorSeq={} pageLimit={used_limit} returned={returned} newMessages={} elapsedMs={}",
+                peer.peer_uid,
+                anchor.msg_seq,
+                page.len() - known,
+                started.elapsed().as_millis(),
+            );
+            if stray {
+                return Ok(LocalHistoryEnd::Unverified(LocalHistoryIssue::TailNotAtEnd));
+            }
+            // pageLimit 变大而条数没变：内核对单页条数有上限，短页不再可信。
+            if previous_count.is_some_and(|previous| returned <= previous) {
+                return Ok(LocalHistoryEnd::Unverified(
+                    LocalHistoryIssue::TailPageLimitCapped,
+                ));
+            }
+            if (returned as i64) < used_limit {
+                return Ok(LocalHistoryEnd::Complete);
+            }
+            previous_count = Some(returned);
+            limit = used_limit * LOCAL_TAIL_LIMIT_GROWTH;
+        }
+        Ok(LocalHistoryEnd::Unverified(
+            LocalHistoryIssue::TailBudgetExhausted,
+        ))
     }
 
     /// 根据筛选条件和性能情况选择最优的获取策略。
@@ -1688,10 +1890,14 @@ fn message_dedupe_key(msg: &Value) -> String {
 
 /// 读取原生 msgId（字符串）。
 fn message_msg_id(msg: &Value) -> Option<String> {
+    raw_msg_id(msg).map(ToString::to_string)
+}
+
+/// 读取原生 msgId，不复制字符串。
+fn raw_msg_id(msg: &Value) -> Option<&str> {
     msg.get("msgId")
         .and_then(Value::as_str)
         .filter(|id| !id.is_empty())
-        .map(ToString::to_string)
 }
 
 /// 边界 seq 下最旧记录的 msgId（msgTime 最小者），作为 msgId 游标。
@@ -1796,7 +2002,6 @@ fn process_seq_page_messages(
         next_message_id: None,
         next_seq,
         local_cursor: None,
-        local_cycle_detected: false,
         actual_count,
         fetch_time_ms: 0,
         earliest_msg_time,
@@ -1882,7 +2087,6 @@ fn process_api_result(
         next_message_id,
         next_seq,
         local_cursor: None,
-        local_cycle_detected: false,
         actual_count,
         fetch_time_ms: 0,
         earliest_msg_time,
@@ -3179,66 +3383,10 @@ mod tests {
         assert!(calls.iter().any(|call| call == "local:m3:3:false:5"));
     }
 
-    /// 实机回归：序号 0 的最后一条后，QQ NT 继续返回较大的正序号，
-    /// 且时间戳有时也会增大，三字段游标仍能正常翻页。
+    /// 游标不前进（内核把上一页的边界记录再次返回）时停止翻页，
+    /// 已读到的记录保留，导出标记为未核验而不是整体失败。
     #[tokio::test]
-    async fn local_history_zero_seq_transition_allows_nonmonotonic_seq_and_time() {
-        let entries = vec![
-            ("z0".to_string(), 0, 1_632_155_183_000),
-            ("p3".to_string(), 2_306_856, 1_632_898_724_000),
-            ("p2".to_string(), 2_306_855, 1_632_898_700_000),
-            ("p1".to_string(), 2_306_854, 1_632_898_680_000),
-        ];
-        let mut mock = SeqBoundaryMock::new(entries);
-        // 此场景按 QQ NT 返回的历史顺序组织，而非 msgSeq 排序。
-        mock.records
-            .sort_by_key(|m| match message_msg_id(m).as_deref() {
-                Some("z0") => 0,
-                Some("p3") => 1,
-                Some("p2") => 2,
-                _ => 3,
-            });
-        mock.positions = mock
-            .records
-            .iter()
-            .enumerate()
-            .filter_map(|(i, m)| message_msg_id(m).map(|id| (id, i)))
-            .collect();
-        let api = Arc::new(mock);
-        let fetcher = BatchMessageFetcher::new(
-            Arc::clone(&api) as Arc<dyn MessageFetchApi>,
-            boundary_fetcher_config(),
-        );
-        let previous = BatchFetchResult {
-            has_more: true,
-            local_cursor: Some(LocalHistoryCursor {
-                msg_id: "z0".to_string(),
-                msg_time: "1632155183".to_string(),
-                msg_seq: "0".to_string(),
-            }),
-            next_message_id: Some("z0".to_string()),
-            next_seq: Some("0".to_string()),
-            ..BatchFetchResult::default()
-        };
-        let batch = fetcher
-            .fetch_next_batch(&group_peer(), &MessageFilter::default(), Some(&previous))
-            .await
-            .expect("合法的序列号增大不应触发游标错误")
-            .expect("应有后续消息");
-        let ids: Vec<String> = batch.messages.iter().filter_map(message_msg_id).collect();
-        assert_eq!(ids, ["p3", "p2", "p1"]);
-        assert_eq!(batch.next_seq.as_deref(), Some("2306854"));
-        assert!(api.call_log().iter().any(|c| c == "local:z0:0:false:5"));
-        let following = fetcher
-            .fetch_next_batch(&group_peer(), &MessageFilter::default(), Some(&batch))
-            .await
-            .expect("历史终点应返回空页而非重读 seq=0");
-        assert!(following.is_none());
-    }
-
-    /// 同一条边界记录被再次返回时仍然拒绝，防止循环与重复导出。
-    #[tokio::test]
-    async fn local_history_repeated_previous_id_still_fails() {
+    async fn local_history_stalled_cursor_stops_as_unverified() {
         let api = Arc::new(
             SeqBoundaryMock::new(vec![
                 ("a".to_string(), 9, 9_000),
@@ -3252,99 +3400,32 @@ mod tests {
         );
         let previous = BatchFetchResult {
             has_more: true,
-            local_cursor: Some(LocalHistoryCursor {
-                msg_id: "a".to_string(),
-                msg_time: "9".to_string(),
-                msg_seq: "9".to_string(),
-            }),
+            local_cursor: Some(local_cursor("a", 9, 9)),
             ..BatchFetchResult::default()
         };
-        let error = fetcher
+        let batch = fetcher
             .fetch_next_batch(&group_peer(), &MessageFilter::default(), Some(&previous))
             .await
-            .expect_err("本地查询重复返回上一页游标自身时必须拒绝");
-        assert!(error.to_string().contains("unchangedCursor=true"));
-    }
-
-    /// 复现真实群 960251923：seq=0 后进入正序号旧区间，多页后重新
-    /// 返回先前的一整页。保留跳序容忍，但在第二次遇到相同页边界时停止。
-    #[tokio::test]
-    async fn local_history_cross_page_cycle_stops_before_infinite_replays() {
-        let api = Arc::new(SeqBoundaryMock::new(Vec::new()));
-        let message = |id: &str, seq: i64, time: i64| {
-            json!({
-                "msgId": id,
-                "msgSeq": seq.to_string(),
-                "msgTime": time.to_string(),
-                "msgType": 2
-            })
-        };
-        // 第一页含 seq0；下一页序号反跳，第三页继续，第四页
-        // 重复第二页末尾的边界消息，但与第三页末尾不同。
-        api.script_local(vec![message("z0", 0, 1640972368)]);
-        api.script_local(vec![
-            message("m5", 27299, 1640970954),
-            message("m4", 23852, 1640422921),
-        ]);
-        api.script_local(vec![
-            message("m3", 23851, 1640422917),
-            message("m2", 23346, 1640278528),
-        ]);
-        api.script_local(vec![
-            message("m5", 27299, 1640970954),
-            message("m4", 23852, 1640422921),
-        ]);
-        let fetcher = BatchMessageFetcher::new(
-            Arc::clone(&api) as Arc<dyn MessageFetchApi>,
-            boundary_fetcher_config(),
+            .expect("游标异常不应让整个导出失败")
+            .expect("当前页仍要交给上层去重");
+        assert!(!batch.has_more);
+        assert_eq!(batch.messages.len(), 1);
+        assert_eq!(
+            fetcher.local_history_end().await,
+            Some(LocalHistoryEnd::Unverified(
+                LocalHistoryIssue::CursorStalled
+            ))
         );
-        let mut previous = BatchFetchResult {
-            has_more: true,
-            local_cursor: Some(LocalHistoryCursor {
-                msg_id: "start".to_string(),
-                msg_time: "1690000000".to_string(),
-                msg_seq: "30000".to_string(),
-            }),
-            ..BatchFetchResult::default()
-        };
-        let mut batches = Vec::new();
-        for _ in 0..4 {
-            let batch = fetcher
-                .fetch_next_batch(&group_peer(), &MessageFilter::default(), Some(&previous))
-                .await
-                .expect("回环必须作为可识别的部分结果返回")
-                .expect("结束前当前页仍要交给上层去重");
-            let done = !batch.has_more;
-            batches.push(batch.clone());
-            previous = batch;
-            if done {
-                break;
-            }
-        }
-        assert_eq!(batches.len(), 4);
-        assert!(!batches[0].local_cycle_detected);
-        assert!(!batches[1].local_cycle_detected);
-        assert!(!batches[2].local_cycle_detected);
-        assert!(batches[3].local_cycle_detected);
-        assert!(!batches[3].has_more);
-        assert_eq!(batches[3].messages.len(), 2);
-        assert!(fetcher
-            .fetch_next_batch(&group_peer(), &MessageFilter::default(), Some(&previous))
-            .await
-            .unwrap()
-            .is_none());
-        assert_eq!(api.call_log().len(), 4, "不得继续读取下一轮重复历史");
+        assert_eq!(api.call_log().len(), 1, "不得继续翻页");
     }
 
-    /// 每次仅序列号回跳，但所有 msgId 都不同，不能误判为跨页循环。
+    /// 从非零游标翻页后出现更大的序号：不符合内核分页模型，停止并标记未核验。
     #[tokio::test]
-    async fn local_history_unique_nonmonotonic_page_does_not_trigger_cycle() {
+    async fn local_history_seq_increase_stops_as_unverified() {
         let api = Arc::new(SeqBoundaryMock::new(Vec::new()));
-        api.script_local(vec![
-            json!({"msgId":"z0","msgSeq":"0","msgTime":"1640972368"}),
-        ]);
         api.script_local(vec![
             json!({"msgId":"b","msgSeq":"27299","msgTime":"1640970954"}),
+            json!({"msgId":"c","msgSeq":"60000","msgTime":"1652925535"}),
         ]);
         let fetcher = BatchMessageFetcher::new(
             Arc::clone(&api) as Arc<dyn MessageFetchApi>,
@@ -3352,27 +3433,571 @@ mod tests {
         );
         let previous = BatchFetchResult {
             has_more: true,
-            local_cursor: Some(LocalHistoryCursor {
-                msg_id: "start".to_string(),
-                msg_time: "1700000000".to_string(),
-                msg_seq: "50000".to_string(),
-            }),
+            local_cursor: Some(local_cursor("start", 1_700_000_000, 50_000)),
             ..BatchFetchResult::default()
         };
-        let first = fetcher
+        let batch = fetcher
             .fetch_next_batch(&group_peer(), &MessageFilter::default(), Some(&previous))
             .await
             .unwrap()
-            .unwrap();
-        let second = fetcher
-            .fetch_next_batch(&group_peer(), &MessageFilter::default(), Some(&first))
+            .expect("异常页的记录必须保留");
+        assert!(!batch.has_more);
+        assert_eq!(batch.messages.len(), 2);
+        assert_eq!(
+            fetcher.local_history_end().await,
+            Some(LocalHistoryEnd::Unverified(LocalHistoryIssue::SeqWentUp))
+        );
+    }
+
+    /// 同一 msgSeq 下的多条记录之间打转：序号没有增大，靠页尾边界集合拦截。
+    #[tokio::test]
+    async fn local_history_repeated_page_boundary_stops_as_unverified() {
+        let api = Arc::new(SeqBoundaryMock::new(Vec::new()));
+        let message = |id: &str| json!({"msgId": id, "msgSeq": "7", "msgTime": "1640970954"});
+        api.script_local(vec![message("x1"), message("x2")]);
+        api.script_local(vec![message("x3"), message("x4")]);
+        api.script_local(vec![message("x2"), message("x5")]);
+        let fetcher = BatchMessageFetcher::new(
+            Arc::clone(&api) as Arc<dyn MessageFetchApi>,
+            boundary_fetcher_config(),
+        );
+        let start = BatchFetchResult {
+            has_more: true,
+            local_cursor: Some(local_cursor("start", 1_690_000_000, 9)),
+            ..BatchFetchResult::default()
+        };
+        let (ids, end) = walk_local(&fetcher, Some(start)).await;
+        assert_eq!(ids, ["x1", "x2", "x3", "x4", "x2", "x5"]);
+        assert_eq!(
+            end,
+            Some(LocalHistoryEnd::Unverified(LocalHistoryIssue::RepeatedPage))
+        );
+        assert_eq!(api.call_log().len(), 3, "不得继续读取下一轮重复历史");
+    }
+
+    /// 带起始时间的导出回溯到范围之外即停止，状态与「读完全部历史」区分开。
+    #[tokio::test]
+    async fn local_history_reports_start_time_stop_separately() {
+        const BASE_MS: i64 = 1_700_000_000_000;
+        let entries: Vec<(String, i64, i64)> = (1..=13)
+            .map(|seq| (format!("m{seq}"), seq, BASE_MS + seq * 1_000_000))
+            .collect();
+        let api = Arc::new(SeqBoundaryMock::new(entries));
+        let fetcher = BatchMessageFetcher::new(
+            Arc::clone(&api) as Arc<dyn MessageFetchApi>,
+            boundary_fetcher_config(),
+        );
+        let start = BatchFetchResult {
+            has_more: true,
+            local_cursor: Some(local_cursor("m13", 1_700_013_000, 13)),
+            ..BatchFetchResult::default()
+        };
+        let filter = MessageFilter {
+            start_time: Some(BASE_MS + 6_500_000),
+            ..MessageFilter::default()
+        };
+        let mut previous = start;
+        let mut ids = Vec::new();
+        while let Some(batch) = fetcher
+            .fetch_next_batch(&group_peer(), &filter, Some(&previous))
             .await
             .unwrap()
-            .unwrap();
-        assert!(!first.local_cycle_detected);
-        assert!(!second.local_cycle_detected);
-        assert!(second.has_more);
-        assert_eq!(second.next_seq.as_deref(), Some("27299"));
+        {
+            ids.extend(batch.messages.iter().filter_map(message_msg_id));
+            previous = batch;
+        }
+        assert_eq!(ids, ["m12", "m11", "m10", "m9", "m8", "m7"]);
+        assert_eq!(
+            fetcher.local_history_end().await,
+            Some(LocalHistoryEnd::ReachedStartTime)
+        );
+    }
+
+    fn local_cursor(msg_id: &str, msg_time: i64, msg_seq: i64) -> LocalHistoryCursor {
+        LocalHistoryCursor {
+            msg_id: msg_id.to_string(),
+            msg_time: msg_time.to_string(),
+            msg_seq: msg_seq.to_string(),
+        }
+    }
+
+    /// 跑完本地回退分页，返回全部批次的 msgId（含重复）与终止状态。
+    async fn walk_local(
+        fetcher: &BatchMessageFetcher,
+        start: Option<BatchFetchResult>,
+    ) -> (Vec<String>, Option<LocalHistoryEnd>) {
+        let mut previous = start;
+        let mut ids = Vec::new();
+        let mut batches = 0;
+        while let Some(batch) = fetcher
+            .fetch_next_batch(&group_peer(), &MessageFilter::default(), previous.as_ref())
+            .await
+            .expect("batch")
+        {
+            ids.extend(batch.messages.iter().filter_map(message_msg_id));
+            batches += 1;
+            assert!(batches < 5_000, "分页未按预期收敛");
+            previous = Some(batch);
+        }
+        (ids, fetcher.local_history_end().await)
+    }
+
+    /// 按 2026-11-22 事故日志还原的 `queryMsgsWithFilterEx` 行为模型
+    /// （见 [`LocalHistoryQuery`]）。该模型逐一重放了群 960251923 无上限分页
+    /// 留下的 1423 个不同请求，除缺失的 10 条 seq=0 记录外全部吻合。
+    ///
+    /// 原生接口的行为对齐已退群的群聊：最新一屏可读，按序号翻页返回 2004010。
+    struct LocalKernelMock {
+        /// (msgId, msgSeq, msgTime 秒)，按内核顺序排列：非零 msgSeq 降序，
+        /// 随后是全部 msgSeq=0 的记录（msgTime 降序）。
+        rows: Vec<(u64, i64, i64)>,
+        /// 第一条 msgSeq=0 记录的下标。
+        zero_start: usize,
+        /// 每次本地查询的 (msgId, msgSeq, includeCurrent, pageLimit)。
+        requests: Mutex<Vec<(String, String, bool, i64)>>,
+        /// 内核对单页条数的硬上限（超出时静默截断）。
+        page_limit_cap: Option<i64>,
+        /// pageLimit 超过该值时查询直接失败。
+        fail_above_limit: Option<i64>,
+    }
+
+    impl LocalKernelMock {
+        fn new(mut rows: Vec<(u64, i64, i64)>) -> Self {
+            rows.sort_by(|a, b| match (a.1, b.1) {
+                (0, 0) => b.2.cmp(&a.2).then_with(|| b.0.cmp(&a.0)),
+                (0, _) => std::cmp::Ordering::Greater,
+                (_, 0) => std::cmp::Ordering::Less,
+                _ => b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)),
+            });
+            let zero_start = rows.iter().position(|row| row.1 == 0).unwrap_or(rows.len());
+            Self {
+                rows,
+                zero_start,
+                requests: Mutex::new(Vec::new()),
+                page_limit_cap: None,
+                fail_above_limit: None,
+            }
+        }
+
+        fn with_page_limit_cap(mut self, cap: i64) -> Self {
+            self.page_limit_cap = Some(cap);
+            self
+        }
+
+        fn with_failure_above_limit(mut self, limit: i64) -> Self {
+            self.fail_above_limit = Some(limit);
+            self
+        }
+
+        fn requests(&self) -> Vec<(String, String, bool, i64)> {
+            self.requests.lock().unwrap().clone()
+        }
+
+        fn to_value(row: &(u64, i64, i64)) -> Value {
+            json!({
+                "msgId": row.0.to_string(),
+                "msgSeq": row.1.to_string(),
+                "msgTime": row.2.to_string(),
+                "msgType": 2,
+            })
+        }
+
+        fn page(
+            &self,
+            msg_id: &str,
+            msg_seq: &str,
+            include_current: bool,
+            limit: usize,
+        ) -> Vec<Value> {
+            let seq: i64 = msg_seq.parse().expect("msgSeq");
+            let id: u64 = msg_id.parse().expect("msgId");
+            if seq != 0 {
+                // 非零游标：只看 msgSeq，seq=0 的记录整体排在最后。
+                let start = self.rows[..self.zero_start].partition_point(|row| {
+                    if include_current {
+                        row.1 > seq
+                    } else {
+                        row.1 >= seq
+                    }
+                });
+                self.rows[start..]
+                    .iter()
+                    .take(limit)
+                    .map(Self::to_value)
+                    .collect()
+            } else if id == 0 {
+                self.rows.iter().take(limit).map(Self::to_value).collect()
+            } else {
+                // seq=0 的真实消息当游标：内核改按 msgId 过滤。
+                self.rows
+                    .iter()
+                    .filter(|row| row.0 < id)
+                    .take(limit)
+                    .map(Self::to_value)
+                    .collect()
+            }
+        }
+
+        fn not_group_member() -> Value {
+            json!({ "result": 2_004_010, "errMsg": "is not group member" })
+        }
+    }
+
+    #[async_trait]
+    impl MessageFetchApi for LocalKernelMock {
+        async fn get_aio_first_view_latest_msgs(
+            &self,
+            _peer: &Peer,
+            count: i64,
+        ) -> Result<Value, String> {
+            let messages = self.page("0", "0", true, count.max(0) as usize);
+            Ok(json!({ "result": 0, "msgList": messages }))
+        }
+
+        async fn get_msg_history(
+            &self,
+            _peer: &Peer,
+            _msg_id: &str,
+            _count: i64,
+        ) -> Result<Value, String> {
+            Ok(Self::not_group_member())
+        }
+
+        async fn get_msgs_by_seq_range(
+            &self,
+            _peer: &Peer,
+            _start_seq: &str,
+            _end_seq: &str,
+        ) -> Result<Value, String> {
+            Ok(Self::not_group_member())
+        }
+
+        async fn get_msgs_by_seq_and_count(
+            &self,
+            _peer: &Peer,
+            _anchor_seq: i64,
+            _count: i64,
+        ) -> Result<Value, String> {
+            Ok(Self::not_group_member())
+        }
+
+        async fn get_local_history(
+            &self,
+            _peer: &Peer,
+            msg_id: &str,
+            _msg_time: &str,
+            msg_seq: &str,
+            include_current: bool,
+            count: i64,
+        ) -> Result<Value, String> {
+            self.requests.lock().unwrap().push((
+                msg_id.to_string(),
+                msg_seq.to_string(),
+                include_current,
+                count,
+            ));
+            if self.fail_above_limit.is_some_and(|limit| count > limit) {
+                return Err("worker crashed".to_string());
+            }
+            let limit = self.page_limit_cap.map_or(count, |cap| count.min(cap));
+            let messages = self.page(msg_id, msg_seq, include_current, limit.max(0) as usize);
+            Ok(json!({ "result": 0, "msgList": messages }))
+        }
+    }
+
+    /// 小规模历史：`nonzero` 条非零序号记录（seq 从 101 起）加 `zero` 条
+    /// seq=0 记录。seq=0 记录的 msgId 插在非零记录中间，模拟迁移导入的编号。
+    fn kernel_rows(nonzero: u64, zero: u64) -> Vec<(u64, i64, i64)> {
+        let mut rows: Vec<(u64, i64, i64)> = (0..nonzero)
+            .map(|i| {
+                (
+                    1_000 + i * 10,
+                    101 + i as i64,
+                    1_600_000_000 + i as i64 * 60,
+                )
+            })
+            .collect();
+        rows.extend((0..zero).map(|i| (1_005 + i * 10, 0, 1_650_000_000 + i as i64 * 60)));
+        rows
+    }
+
+    fn kernel_fetcher(api: &Arc<LocalKernelMock>, batch_size: i64) -> BatchMessageFetcher {
+        BatchMessageFetcher::new(
+            Arc::clone(api) as Arc<dyn MessageFetchApi>,
+            BatchFetchConfig {
+                batch_size,
+                retry_count: 0,
+                retry_interval_ms: 0,
+                ..BatchFetchConfig::default()
+            },
+        )
+    }
+
+    /// 没有任何请求把 seq=0 的真实消息当作游标。
+    fn assert_no_zero_seq_cursor(requests: &[(String, String, bool, i64)]) {
+        assert!(
+            requests
+                .iter()
+                .all(|(id, seq, _, _)| seq != "0" || id == "0"),
+            "seq=0 的消息不能作为翻页游标: {requests:?}"
+        );
+    }
+
+    /// 模型自检：seq=0 的消息当游标时，内核按 msgId 过滤并跳回更新的区间。
+    /// 这是事故中无限循环的来源，下面的用例都依赖 mock 保留这一行为。
+    #[test]
+    fn local_kernel_mock_zero_seq_cursor_jumps_back() {
+        let api = LocalKernelMock::new(kernel_rows(13, 9));
+        // 最旧的 seq=0 记录（msgId=1005）夹在 seq=101 与 seq=102 之间。
+        let page = api.page("1005", "0", false, 5);
+        let seqs: Vec<i64> = page.iter().filter_map(loose_msg_seq).collect();
+        assert_eq!(seqs, [101], "只剩 msgId 更小的记录，而不是尾段的后续");
+        let page = api.page("1085", "0", false, 5);
+        let seqs: Vec<i64> = page.iter().filter_map(loose_msg_seq).collect();
+        assert_eq!(
+            seqs,
+            [109, 108, 107, 106, 105],
+            "跳回已经读过的非零序号区间"
+        );
+    }
+
+    /// 复现群 960251923 事故的最后一页（qce-server.log 2026-11-22 11:21:47 UTC，
+    /// 第 1157 个请求），游标与边界记录使用日志里的真实取值：
+    /// 游标 seq=6166 之后剩 447 条非零序号记录和 63 条 seq=0 记录，500 条的满页
+    /// 恰好停在第 53 条 seq=0 记录上。旧实现拿它当游标，内核跳回 seq=162343
+    /// 后循环；最旧的 10 条 seq=0 记录没有进入当时的导出文件。
+    #[tokio::test(start_paused = true)]
+    async fn local_history_incident_page_reads_whole_zero_seq_tail() {
+        const Z53: u64 = 7_364_343_445_115_159_676;
+        const Z63: u64 = 7_364_343_392_942_836_996;
+        let mut rows = vec![
+            // 更新区间内的记录：msgId 小于 Z53，seq=0 游标会跳回这里。
+            (7_364_343_443_804_498_622, 162_343, 1_652_925_535),
+            (7_364_343_443_804_498_359, 162_217, 1_652_889_475),
+            (7_364_343_384_774_841_018, 6_166, 1_637_836_282),
+            (7_364_343_384_774_841_016, 6_165, 1_637_836_281),
+        ];
+        // seq 5570..=6015：共 446 条，加上 6165 即日志中该页的 447 条非零记录。
+        rows.extend((0..446_u64).map(|i| {
+            (
+                7_364_343_383_609_136_765 + i * 2,
+                5_570 + i as i64,
+                1_637_676_912 + i as i64 * 12,
+            )
+        }));
+        // 63 条 seq=0 记录，时间从 2023-08-08 递减到 2021-12-31。
+        rows.extend((0..52_u64).map(|i| {
+            (
+                7_364_343_693_368_147_127 - i * 1_000_003,
+                0,
+                1_691_505_242 - i as i64 * 600_000,
+            )
+        }));
+        rows.push((Z53, 0, 1_652_500_711));
+        rows.extend(
+            (1..=9_u64).map(|i| (Z53 - i * 1_000_003, 0, 1_652_500_711 - i as i64 * 1_000_000)),
+        );
+        rows.push((Z63, 0, 1_640_972_368));
+        let total_after_cursor = 447 + 63;
+
+        let api = Arc::new(LocalKernelMock::new(rows));
+        let fetcher = kernel_fetcher(&api, 3_000);
+        let start = BatchFetchResult {
+            has_more: true,
+            local_cursor: Some(local_cursor("7364343384774841018", 1_637_836_282, 6_166)),
+            ..BatchFetchResult::default()
+        };
+        let (ids, end) = walk_local(&fetcher, Some(start)).await;
+
+        assert_eq!(end, Some(LocalHistoryEnd::Complete));
+        assert_eq!(ids.len(), total_after_cursor, "不重复、不遗漏");
+        let unique: HashSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), total_after_cursor);
+        assert!(
+            unique.contains(&Z63.to_string()),
+            "最旧的 seq=0 记录必须读到"
+        );
+        assert_eq!(
+            api.requests(),
+            [
+                (
+                    "7364343384774841018".to_string(),
+                    "6166".to_string(),
+                    false,
+                    500
+                ),
+                // 尾段从最后一条非零序号记录（seq=5570）重查，63 条 < 500 即终点。
+                (
+                    "7364343383609136765".to_string(),
+                    "5570".to_string(),
+                    false,
+                    500
+                ),
+            ]
+        );
+    }
+
+    /// 真实数据量级（578,447 条非零序号 + 63 条 seq=0，页大小 500）下的查询
+    /// 预算：请求数应为 1157 页 + 1 次尾段查询，全部记录恰好各读到一次。
+    /// 事故中同样的历史在无上限分页时发出了 37,462 个请求。
+    #[tokio::test(start_paused = true)]
+    async fn local_history_real_scale_walk_stays_within_request_budget() {
+        const NONZERO: u64 = 578_447;
+        const ZERO: u64 = 63;
+        let mut rows: Vec<(u64, i64, i64)> = (0..NONZERO)
+            .map(|i| {
+                (
+                    7_364_343_383_609_136_765 + i * 2,
+                    5_570 + i as i64,
+                    1_637_676_912 + i as i64 * 95,
+                )
+            })
+            .collect();
+        // seq=0 记录的 msgId 落在非零记录之间，seq=0 游标会跳回旧区间。
+        rows.extend((0..ZERO).map(|i| {
+            (
+                7_364_343_383_609_136_766 + i * 18_000,
+                0,
+                1_640_972_368 + i as i64 * 800_000,
+            )
+        }));
+        let api = Arc::new(LocalKernelMock::new(rows));
+        let fetcher = kernel_fetcher(&api, 3_000);
+
+        let mut previous: Option<BatchFetchResult> = None;
+        let mut unique = HashSet::new();
+        let mut fetched = 0_u64;
+        while let Some(batch) = fetcher
+            .fetch_next_batch(&group_peer(), &MessageFilter::default(), previous.as_ref())
+            .await
+            .expect("batch")
+        {
+            for id in batch.messages.iter().filter_map(message_msg_id) {
+                fetched += 1;
+                unique.insert(id);
+            }
+            previous = Some(BatchFetchResult {
+                messages: Vec::new(),
+                ..batch
+            });
+        }
+
+        assert_eq!(
+            fetcher.local_history_end().await,
+            Some(LocalHistoryEnd::Complete)
+        );
+        assert_eq!(unique.len() as u64, NONZERO + ZERO);
+        assert_eq!(fetched, NONZERO + ZERO, "没有重复抓取");
+        let requests = api.requests();
+        assert_eq!(requests.len(), 1_157 + 1);
+        assert_no_zero_seq_cursor(&requests);
+    }
+
+    /// 尾段超过一页：从非零锚点重查并放大 pageLimit，直到返回短页。
+    #[tokio::test(start_paused = true)]
+    async fn local_history_zero_seq_tail_longer_than_a_page_is_completed() {
+        let api = Arc::new(LocalKernelMock::new(kernel_rows(13, 9)));
+        let fetcher = kernel_fetcher(&api, 5);
+        let (ids, end) = walk_local(&fetcher, None).await;
+
+        assert_eq!(end, Some(LocalHistoryEnd::Complete));
+        let unique: HashSet<&String> = ids.iter().collect();
+        assert_eq!((ids.len(), unique.len()), (22, 22));
+        let requests = api.requests();
+        assert_no_zero_seq_cursor(&requests);
+        let limits: Vec<i64> = requests.iter().map(|request| request.3).collect();
+        // 三页常规分页，随后尾段查询 5 条（满页）→ 20 条（返回 9 条，短页）。
+        assert_eq!(limits, [5, 5, 5, 5, 20]);
+        assert_eq!(requests[3].1, "101", "尾段锚点是最后一条非零序号记录");
+        assert_eq!(requests[4].1, "101");
+    }
+
+    /// 以 seq=0 结尾的短页本身就是终点，不需要任何额外请求。
+    #[tokio::test(start_paused = true)]
+    async fn local_history_short_page_ending_in_zero_seq_is_the_end() {
+        let api = Arc::new(LocalKernelMock::new(kernel_rows(8, 1)));
+        let fetcher = kernel_fetcher(&api, 5);
+        let (ids, end) = walk_local(&fetcher, None).await;
+
+        assert_eq!(end, Some(LocalHistoryEnd::Complete));
+        assert_eq!(ids.len(), 9);
+        // 第二页 3 条非零序号 + 1 条 seq=0，不满 5 条。
+        assert_eq!(api.requests().len(), 2);
+    }
+
+    /// 整页都是 seq=0（没有非零锚点）：沿用同一起点放大 pageLimit。
+    #[tokio::test(start_paused = true)]
+    async fn local_history_all_zero_seq_page_grows_from_same_start() {
+        let api = Arc::new(LocalKernelMock::new(kernel_rows(0, 7)));
+        let fetcher = kernel_fetcher(&api, 5);
+        let (ids, end) = walk_local(&fetcher, None).await;
+
+        assert_eq!(end, Some(LocalHistoryEnd::Complete));
+        let unique: HashSet<&String> = ids.iter().collect();
+        assert_eq!((ids.len(), unique.len()), (7, 7));
+        assert_eq!(
+            api.requests(),
+            [
+                ("0".to_string(), "0".to_string(), true, 5),
+                ("0".to_string(), "0".to_string(), true, 20),
+            ]
+        );
+    }
+
+    /// 内核静默截断 pageLimit 时短页不再可信：停止、保留记录、标记未核验。
+    #[tokio::test(start_paused = true)]
+    async fn local_history_capped_page_limit_is_reported_as_unverified() {
+        let api = Arc::new(LocalKernelMock::new(kernel_rows(3, 12)).with_page_limit_cap(5));
+        let fetcher = kernel_fetcher(&api, 5);
+        let (ids, end) = walk_local(&fetcher, None).await;
+
+        assert_eq!(
+            end,
+            Some(LocalHistoryEnd::Unverified(
+                LocalHistoryIssue::TailPageLimitCapped
+            ))
+        );
+        let unique: HashSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), 3 + 5, "已读到的记录全部保留");
+        let requests = api.requests();
+        assert_eq!(requests.len(), 3);
+        assert_no_zero_seq_cursor(&requests);
+    }
+
+    /// 尾段异常庞大：三次放大后仍是满页则止损，不无限放大窗口。
+    #[tokio::test(start_paused = true)]
+    async fn local_history_oversized_zero_seq_tail_stops_within_budget() {
+        let api = Arc::new(LocalKernelMock::new(kernel_rows(3, 100)));
+        let fetcher = kernel_fetcher(&api, 5);
+        let (ids, end) = walk_local(&fetcher, None).await;
+
+        assert_eq!(
+            end,
+            Some(LocalHistoryEnd::Unverified(
+                LocalHistoryIssue::TailBudgetExhausted
+            ))
+        );
+        let unique: HashSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), 3 + 80, "最大窗口内读到的记录全部保留");
+        let limits: Vec<i64> = api.requests().iter().map(|request| request.3).collect();
+        assert_eq!(limits, [5, 5, 20, 80]);
+    }
+
+    /// 尾段查询失败不丢弃已抓取的记录，导出降级为未核验。
+    #[tokio::test(start_paused = true)]
+    async fn local_history_tail_query_failure_keeps_fetched_messages() {
+        let api = Arc::new(LocalKernelMock::new(kernel_rows(3, 12)).with_failure_above_limit(5));
+        let fetcher = kernel_fetcher(&api, 5);
+        let (ids, end) = walk_local(&fetcher, None).await;
+
+        assert!(matches!(
+            end,
+            Some(LocalHistoryEnd::Unverified(
+                LocalHistoryIssue::TailQueryFailed(_)
+            ))
+        ));
+        let unique: HashSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), 3 + 5);
     }
 
     /// 即使 #716 边界补读遭到 2004010，仍能从本地库读取完整记录。

@@ -50,8 +50,8 @@ use crate::clean_message_spool::{CleanMessageSpool, SpooledCleanMessageSource};
 use crate::export_debug::ExportDebugSession;
 use crate::fetcher::{
     acquire_history_query_permit, chat_type_prefix, classify_chat_type_binary,
-    repair_group_message_sequence, BatchFetchConfig, BatchMessageFetcher, MessageFilter, Peer,
-    SequenceRepairConfig, GROUP_CHAT_TYPE,
+    repair_group_message_sequence, BatchFetchConfig, BatchMessageFetcher, LocalHistoryEnd,
+    MessageFilter, Peer, SequenceRepairConfig, GROUP_CHAT_TYPE,
 };
 use crate::parser::simple_parser::ReplyImageIndex;
 use crate::parser::{ForwardFetcher, SimpleMessageParser, SimpleParserOptions};
@@ -2353,8 +2353,9 @@ async fn process_export_task(
         .map_err(|e| format!("创建输出目录失败: {e}"))?;
     let mut spool =
         RawMessageSpool::create(req.output_dir.join(format!(".qce_spool_{task_id}.jsonl"))).await?;
-    // 本地群历史回退检测到跨页重复时保留已经读取的记录，但不能宣称全量完整。
-    let mut local_history_partial = false;
+    // 本地群历史回退异常终止时保留已经读取的记录，但不能宣称全量完整；
+    // 这里记录未核验的原因，随任务结果一起展示。
+    let mut local_history_partial: Option<String> = None;
     match input {
         ExportInput::Standard => {
             let batch_size = loose_i64(req.options.get("batchSize")).unwrap_or(5000);
@@ -2403,13 +2404,6 @@ async fn process_export_task(
                     Ok(None) => break,
                     Err(error) => return Err(format!("获取消息失败: {error}")),
                 };
-                if batch.local_cycle_detected {
-                    local_history_partial = true;
-                    tracing::warn!(
-                        "[Export] 本地历史出现跨页循环：peer={}；停止翻页并保留现有消息，导出标记为可能不完整",
-                        peer.peer_uid
-                    );
-                }
                 batch_count += 1;
                 for message in &batch.messages {
                     let Some(seq) = loose_i64(message.get("msgSeq")) else {
@@ -2433,6 +2427,23 @@ async fn process_export_task(
                 )
                 .await;
                 previous = Some(batch);
+            }
+
+            match fetcher.local_history_end().await {
+                Some(LocalHistoryEnd::Unverified(issue)) => {
+                    tracing::warn!(
+                        "[Export] 本地历史分页异常终止：peer={} reason={issue}；保留现有 {} 条记录，导出标记为未核验",
+                        peer.peer_uid,
+                        spool.count()
+                    );
+                    local_history_partial = Some(issue.to_string());
+                }
+                Some(end) => tracing::info!(
+                    "[Export] 本地历史分页结束：peer={} status={end:?} messages={}",
+                    peer.peer_uid,
+                    spool.count()
+                ),
+                None => {}
             }
 
             // issue #662：导出流程不再做全量序列修复。
@@ -3116,10 +3127,10 @@ async fn process_export_task(
         .as_ref()
         .and_then(|s| serde_json::to_value(s).ok());
     let summary_message = build_resource_summary_message(resource_summary.as_ref());
-    let completion_message = if local_history_partial {
+    let completion_message = if let Some(reason) = &local_history_partial {
         summary_message.map_or_else(
-            || "部分导出完成 · 检测到本地历史重复分页；结果可能不完整".to_string(),
-            |s| format!("部分导出完成 · 历史分页循环，结果可能不完整 · {s}"),
+            || format!("部分导出完成 · 本地历史未核验（{reason}），结果可能不完整"),
+            |s| format!("部分导出完成 · 本地历史未核验（{reason}），结果可能不完整 · {s}"),
         )
     } else {
         summary_message.map_or_else(|| "导出完成".to_string(), |s| format!("导出完成 · {s}"))
@@ -3161,7 +3172,8 @@ async fn process_export_task(
             "progress": 100,
             "message": completion_message,
             "messageCount": message_count,
-            "historyPartial": local_history_partial,
+            "historyPartial": local_history_partial.is_some(),
+            "historyPartialReason": local_history_partial,
             "filePath": final_file_path.to_string_lossy(),
             "downloadUrl": final_download_url,
             "fileSize": file_size,
@@ -3188,7 +3200,8 @@ async fn process_export_task(
                 "progress": 100,
                 "message": completion_message,
                 "messageCount": message_count,
-                "historyPartial": local_history_partial,
+                "historyPartial": local_history_partial.is_some(),
+                "historyPartialReason": local_history_partial,
                 "fileName": final_file_name,
                 "filePath": final_file_path.to_string_lossy(),
                 "fileSize": file_size,
