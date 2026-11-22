@@ -703,10 +703,12 @@ impl BatchMessageFetcher {
             // 统计页内是否出现序号逆向跳变；这不改变既有校验逻辑。
             let seq_order_increases = raw_messages
                 .windows(2)
-                .filter(|pair| match (loose_msg_seq(&pair[0]), loose_msg_seq(&pair[1])) {
-                    (Some(a), Some(b)) => b > a,
-                    _ => false,
-                })
+                .filter(
+                    |pair| match (loose_msg_seq(&pair[0]), loose_msg_seq(&pair[1])) {
+                        (Some(a), Some(b)) => b > a,
+                        _ => false,
+                    },
+                )
                 .count();
             // QQ NT 本地库的 msgSeq 不是跨整个历史稳定单调的：
             // 实机验证 seq=0 后可继续读到非零序号，且时间戳也可能回跳。
@@ -2747,12 +2749,14 @@ mod tests {
             } else {
                 self.records
                     .iter()
-                    .position(|msg| loose_msg_seq(msg).is_some_and(|seq| {
-                        seq <= msg_seq.parse::<i64>().unwrap_or(0)
-                    }))
+                    .position(|msg| {
+                        loose_msg_seq(msg)
+                            .is_some_and(|seq| seq <= msg_seq.parse::<i64>().unwrap_or(0))
+                    })
                     .unwrap_or(self.records.len())
             };
-            let messages: Vec<Value> = self.records
+            let messages: Vec<Value> = self
+                .records
                 .iter()
                 .skip(start)
                 .take(count.max(0) as usize)
@@ -3157,16 +3161,20 @@ mod tests {
             let Some(batch) = fetcher
                 .fetch_next_batch(&group_peer(), &MessageFilter::default(), Some(&previous))
                 .await
-                .expect("2004010 应进入本地分页") else {
-                    break;
-                };
+                .expect("2004010 应进入本地分页")
+            else {
+                break;
+            };
             ids.extend(batch.messages.iter().filter_map(message_msg_id));
             previous = batch;
         }
         let expected: Vec<String> = (1..=7).rev().map(|seq| format!("m{seq}")).collect();
         assert_eq!(ids, expected);
         let calls = api.call_log();
-        assert_eq!(calls.iter().filter(|call| call.starts_with("seq:")).count(), 1);
+        assert_eq!(
+            calls.iter().filter(|call| call.starts_with("seq:")).count(),
+            1
+        );
         assert!(calls.iter().any(|call| call == "local:0:7:true:5"));
         assert!(calls.iter().any(|call| call == "local:m3:3:false:5"));
     }
@@ -3183,13 +3191,17 @@ mod tests {
         ];
         let mut mock = SeqBoundaryMock::new(entries);
         // 此场景按 QQ NT 返回的历史顺序组织，而非 msgSeq 排序。
-        mock.records.sort_by_key(|m| match message_msg_id(m).as_deref() {
-            Some("z0") => 0,
-            Some("p3") => 1,
-            Some("p2") => 2,
-            _ => 3,
-        });
-        mock.positions = mock.records.iter().enumerate()
+        mock.records
+            .sort_by_key(|m| match message_msg_id(m).as_deref() {
+                Some("z0") => 0,
+                Some("p3") => 1,
+                Some("p2") => 2,
+                _ => 3,
+            });
+        mock.positions = mock
+            .records
+            .iter()
+            .enumerate()
             .filter_map(|(i, m)| message_msg_id(m).map(|id| (id, i)))
             .collect();
         let api = Arc::new(mock);
@@ -3227,10 +3239,13 @@ mod tests {
     /// 同一条边界记录被再次返回时仍然拒绝，防止循环与重复导出。
     #[tokio::test]
     async fn local_history_repeated_previous_id_still_fails() {
-        let api = Arc::new(SeqBoundaryMock::new(vec![
-            ("a".to_string(), 9, 9_000),
-            ("b".to_string(), 8, 8_000),
-        ]).with_stalled_local_history());
+        let api = Arc::new(
+            SeqBoundaryMock::new(vec![
+                ("a".to_string(), 9, 9_000),
+                ("b".to_string(), 8, 8_000),
+            ])
+            .with_stalled_local_history(),
+        );
         let fetcher = BatchMessageFetcher::new(
             Arc::clone(&api) as Arc<dyn MessageFetchApi>,
             boundary_fetcher_config(),
@@ -3249,7 +3264,6 @@ mod tests {
             .await
             .expect_err("本地查询重复返回上一页游标自身时必须拒绝");
         assert!(error.to_string().contains("unchangedCursor=true"));
-
     }
 
     /// 复现真实群 960251923：seq=0 后进入正序号旧区间，多页后重新
@@ -3268,9 +3282,18 @@ mod tests {
         // 第一页含 seq0；下一页序号反跳，第三页继续，第四页
         // 重复第二页末尾的边界消息，但与第三页末尾不同。
         api.script_local(vec![message("z0", 0, 1640972368)]);
-        api.script_local(vec![message("m5", 27299, 1640970954), message("m4", 23852, 1640422921)]);
-        api.script_local(vec![message("m3", 23851, 1640422917), message("m2", 23346, 1640278528)]);
-        api.script_local(vec![message("m5", 27299, 1640970954), message("m4", 23852, 1640422921)]);
+        api.script_local(vec![
+            message("m5", 27299, 1640970954),
+            message("m4", 23852, 1640422921),
+        ]);
+        api.script_local(vec![
+            message("m3", 23851, 1640422917),
+            message("m2", 23346, 1640278528),
+        ]);
+        api.script_local(vec![
+            message("m5", 27299, 1640970954),
+            message("m4", 23852, 1640422921),
+        ]);
         let fetcher = BatchMessageFetcher::new(
             Arc::clone(&api) as Arc<dyn MessageFetchApi>,
             boundary_fetcher_config(),
@@ -3294,7 +3317,9 @@ mod tests {
             let done = !batch.has_more;
             batches.push(batch.clone());
             previous = batch;
-            if done { break; }
+            if done {
+                break;
+            }
         }
         assert_eq!(batches.len(), 4);
         assert!(!batches[0].local_cycle_detected);
@@ -3303,9 +3328,11 @@ mod tests {
         assert!(batches[3].local_cycle_detected);
         assert!(!batches[3].has_more);
         assert_eq!(batches[3].messages.len(), 2);
-        assert!(fetcher.fetch_next_batch(
-            &group_peer(), &MessageFilter::default(), Some(&previous)
-        ).await.unwrap().is_none());
+        assert!(fetcher
+            .fetch_next_batch(&group_peer(), &MessageFilter::default(), Some(&previous))
+            .await
+            .unwrap()
+            .is_none());
         assert_eq!(api.call_log().len(), 4, "不得继续读取下一轮重复历史");
     }
 
@@ -3313,8 +3340,12 @@ mod tests {
     #[tokio::test]
     async fn local_history_unique_nonmonotonic_page_does_not_trigger_cycle() {
         let api = Arc::new(SeqBoundaryMock::new(Vec::new()));
-        api.script_local(vec![json!({"msgId":"z0","msgSeq":"0","msgTime":"1640972368"})]);
-        api.script_local(vec![json!({"msgId":"b","msgSeq":"27299","msgTime":"1640970954"})]);
+        api.script_local(vec![
+            json!({"msgId":"z0","msgSeq":"0","msgTime":"1640972368"}),
+        ]);
+        api.script_local(vec![
+            json!({"msgId":"b","msgSeq":"27299","msgTime":"1640970954"}),
+        ]);
         let fetcher = BatchMessageFetcher::new(
             Arc::clone(&api) as Arc<dyn MessageFetchApi>,
             boundary_fetcher_config(),
@@ -3328,12 +3359,16 @@ mod tests {
             }),
             ..BatchFetchResult::default()
         };
-        let first = fetcher.fetch_next_batch(
-            &group_peer(), &MessageFilter::default(), Some(&previous)
-        ).await.unwrap().unwrap();
-        let second = fetcher.fetch_next_batch(
-            &group_peer(), &MessageFilter::default(), Some(&first)
-        ).await.unwrap().unwrap();
+        let first = fetcher
+            .fetch_next_batch(&group_peer(), &MessageFilter::default(), Some(&previous))
+            .await
+            .unwrap()
+            .unwrap();
+        let second = fetcher
+            .fetch_next_batch(&group_peer(), &MessageFilter::default(), Some(&first))
+            .await
+            .unwrap()
+            .unwrap();
         assert!(!first.local_cycle_detected);
         assert!(!second.local_cycle_detected);
         assert!(second.has_more);
@@ -3361,5 +3396,4 @@ mod tests {
         assert_eq!(ids, expected);
         assert!(api.call_log().iter().any(|call| call == "local:0:0:true:5"));
     }
-
 }
