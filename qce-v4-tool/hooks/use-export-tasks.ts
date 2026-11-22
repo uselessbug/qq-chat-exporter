@@ -67,6 +67,7 @@ function buildCompletedToastDescription(task: ExportTask, data: ProgressPayload)
   const originalFilePath = data.originalFilePath ?? task.originalFilePath
   const isHtmlExport = task.format?.toUpperCase() === "HTML" && !isStreamingZip
   const isPartialRoaming = task.taskKind === "roaming_export" && task.roamingScan?.partial === true
+  const isPartialHistory = data.historyPartial === true || task.historyPartial === true
 
   let prefix = ""
   if (isStreamingJsonl) {
@@ -84,6 +85,9 @@ function buildCompletedToastDescription(task: ExportTask, data: ProgressPayload)
     null,
     isPartialRoaming
       ? "漫游扫描已完成，但结果可能不完整；请到任务页查看停止原因和扫描说明。 "
+      : null,
+    isPartialHistory
+      ? "检测到 QQ 本地历史分页循环，已停止重复抓取。导出文件可能不包含完整历史，请核对最早消息。 "
       : null,
     prefix ? `${prefix} ` : null,
     "如果有帮助到你，给我点个 ",
@@ -129,6 +133,7 @@ function createFallbackTask(data: ProgressPayload): ExportTask {
     originalFilePath: data.originalFilePath,
     taskKind: data.taskKind,
     roamingScan: data.roamingScan,
+    historyPartial: data.historyPartial,
   }
 }
 
@@ -326,14 +331,17 @@ export function useExportTasks(_props?: UseExportTasksProps) {
         completedAt: task.completedAt,
         isZipExport: task.isZipExport,
         originalFilePath: task.originalFilePath,
+        historyPartial: task.historyPartial,
       }
 
       const actions = buildCompletedActions(task, payload)
       const isPartialRoaming = task.taskKind === "roaming_export" && task.roamingScan?.partial === true
+      const isPartialHistory = payload.historyPartial === true || task.historyPartial === true
+      const isPartial = isPartialRoaming || isPartialHistory
 
       toast.update(toastId, {
-        type: isPartialRoaming ? "warning" : "success",
-        title: isPartialRoaming
+        type: isPartial ? "warning" : "success",
+        title: isPartial
           ? "导出完成（结果可能不完整）"
           : "导出完成",
         description: buildCompletedToastDescription(task, payload),

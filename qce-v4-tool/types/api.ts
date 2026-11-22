@@ -215,6 +215,8 @@ export interface ExportTask {
   taskKind?: "standard_export" | "roaming_export"
   /** 漫游扫描进度/边界摘要；不包含消息正文或账号凭据。 */
   roamingScan?: RoamingScanSummary
+  /** 本地历史分页发生跨页循环，已保留已抓取消息，但无法证明历史完整。 */
+  historyPartial?: boolean
 }
 
 /**

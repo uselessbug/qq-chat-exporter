@@ -2052,6 +2052,11 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
                                 结果可能不完整
                               </Badge>
                             )}
+                            {task.historyPartial && (
+                              <Badge className="border-0 bg-amber-500/10 px-1.5 py-0 text-[11px] text-amber-700 dark:text-amber-300" title="检测到历史分页循环，结果可能不完整">
+                                部分导出 · 历史未核验
+                              </Badge>
+                            )}
                             <TaskFormatLabel format={task.format} className="text-xs text-muted-foreground" />
                             <span className="text-xs text-muted-foreground">{new Date(task.createdAt).toLocaleDateString()}</span>
                             {task.messageCount !== undefined && task.messageCount > 0 && (
@@ -2202,6 +2207,11 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
                         <div className="mt-0.5 flex flex-wrap items-center gap-3 text-xs text-muted-foreground/50">
                           {formatTaskPeerLabel(task.peer) && (
                             <span className="font-mono">{formatTaskPeerLabel(task.peer)}</span>
+                          )}
+                          {task.historyPartial && (
+                            <Badge className="border-0 bg-amber-500/10 px-1.5 py-0 text-[11px] text-amber-700 dark:text-amber-300" title="检测到历史分页循环，结果可能不完整">
+                              部分导出 · 历史未核验
+                            </Badge>
                           )}
                           <TaskFormatLabel format={task.format} />
                           <span>{new Date(task.createdAt).toLocaleDateString()}</span>

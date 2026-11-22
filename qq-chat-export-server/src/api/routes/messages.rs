@@ -2353,6 +2353,8 @@ async fn process_export_task(
         .map_err(|e| format!("创建输出目录失败: {e}"))?;
     let mut spool =
         RawMessageSpool::create(req.output_dir.join(format!(".qce_spool_{task_id}.jsonl"))).await?;
+    // 本地群历史回退检测到跨页重复时保留已经读取的记录，但不能宣称全量完整。
+    let mut local_history_partial = false;
     match input {
         ExportInput::Standard => {
             let batch_size = loose_i64(req.options.get("batchSize")).unwrap_or(5000);
@@ -2401,6 +2403,13 @@ async fn process_export_task(
                     Ok(None) => break,
                     Err(error) => return Err(format!("获取消息失败: {error}")),
                 };
+                if batch.local_cycle_detected {
+                    local_history_partial = true;
+                    tracing::warn!(
+                        "[Export] 本地历史出现跨页循环：peer={}；停止翻页并保留现有消息，导出标记为可能不完整",
+                        peer.peer_uid
+                    );
+                }
                 batch_count += 1;
                 for message in &batch.messages {
                     let Some(seq) = loose_i64(message.get("msgSeq")) else {
@@ -3107,8 +3116,14 @@ async fn process_export_task(
         .as_ref()
         .and_then(|s| serde_json::to_value(s).ok());
     let summary_message = build_resource_summary_message(resource_summary.as_ref());
-    let completion_message =
-        summary_message.map_or_else(|| "导出完成".to_string(), |s| format!("导出完成 · {s}"));
+    let completion_message = if local_history_partial {
+        summary_message.map_or_else(
+            || "部分导出完成 · 检测到本地历史重复分页；结果可能不完整".to_string(),
+            |s| format!("部分导出完成 · 历史分页循环，结果可能不完整 · {s}"),
+        )
+    } else {
+        summary_message.map_or_else(|| "导出完成".to_string(), |s| format!("导出完成 · {s}"))
+    };
     let debug_path = if let Some(debug) = debug_session {
         debug
             .write_json(
@@ -3146,6 +3161,7 @@ async fn process_export_task(
             "progress": 100,
             "message": completion_message,
             "messageCount": message_count,
+            "historyPartial": local_history_partial,
             "filePath": final_file_path.to_string_lossy(),
             "downloadUrl": final_download_url,
             "fileSize": file_size,
@@ -3172,6 +3188,7 @@ async fn process_export_task(
                 "progress": 100,
                 "message": completion_message,
                 "messageCount": message_count,
+                "historyPartial": local_history_partial,
                 "fileName": final_file_name,
                 "filePath": final_file_path.to_string_lossy(),
                 "fileSize": file_size,

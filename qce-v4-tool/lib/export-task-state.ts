@@ -15,6 +15,7 @@ export type ExportTaskUpdate = {
   filePath?: string
   taskKind?: "standard_export" | "roaming_export"
   roamingScan?: RoamingScanSummary
+  historyPartial?: boolean
 }
 
 export function isActiveExportTaskStatus(status: ExportTask["status"]): boolean {
@@ -51,6 +52,7 @@ export type ExportTaskResync = {
   error?: string
   taskKind?: "standard_export" | "roaming_export"
   roamingScan?: RoamingScanSummary
+  historyPartial?: boolean
 }
 
 export function mergeExportTaskUpdate(task: ExportTask, data: ExportTaskUpdate): ExportTask {
@@ -72,6 +74,7 @@ export function mergeExportTaskUpdate(task: ExportTask, data: ExportTaskUpdate):
     ...(data.originalFilePath !== undefined && { originalFilePath: data.originalFilePath }),
     ...(data.taskKind !== undefined && { taskKind: data.taskKind }),
     ...(data.roamingScan !== undefined && { roamingScan: data.roamingScan }),
+    ...(data.historyPartial !== undefined && { historyPartial: data.historyPartial }),
   }
 }
 
@@ -101,6 +104,7 @@ export function mergePendingExportTaskUpdate(
     originalFilePath: pending.originalFilePath,
     taskKind: pending.taskKind,
     roamingScan: pending.roamingScan,
+    historyPartial: pending.historyPartial,
   })
 }
 
@@ -131,6 +135,7 @@ export function mergeExportTaskResync(
   const nextError = remote.error ?? task.error
   const nextTaskKind = remote.taskKind ?? task.taskKind
   const nextRoamingScan = remote.roamingScan ?? task.roamingScan
+  const nextHistoryPartial = remote.historyPartial ?? task.historyPartial
 
   if (
     remoteStatus === task.status &&
@@ -138,7 +143,8 @@ export function mergeExportTaskResync(
     nextMessageCount === task.messageCount &&
     nextError === task.error &&
     nextTaskKind === task.taskKind &&
-    nextRoamingScan === task.roamingScan
+    nextRoamingScan === task.roamingScan &&
+    nextHistoryPartial === task.historyPartial
   ) {
     return task
   }
@@ -151,6 +157,7 @@ export function mergeExportTaskResync(
     error: nextError,
     taskKind: nextTaskKind,
     roamingScan: nextRoamingScan,
+    historyPartial: nextHistoryPartial,
   }
 }
 
@@ -174,6 +181,7 @@ export function mergeRemoteExportTasks(
       progressMessage: task.progressMessage ?? task.message,
       taskKind: task.taskKind ?? local?.taskKind,
       roamingScan: task.roamingScan ?? local?.roamingScan,
+      historyPartial: task.historyPartial ?? local?.historyPartial,
     }
   })
   // A GET /api/tasks response represents the server snapshot from when that
