@@ -207,6 +207,9 @@ impl LocalHistoryCursor {
 ///
 /// 因此起点只能是非零 msgSeq 的游标或「从最新开始」的全零游标，
 /// 绝不能把 seq=0 的消息当作游标继续翻页。
+///
+/// 2026-11-22 在同一个群上实机复核：从最后一条非零序号记录重查得到完整的
+/// seq=0 尾段（短页），`pageLimit` 大于 500 时按请求值返回。
 #[derive(Debug, Clone)]
 struct LocalHistoryQuery {
     msg_id: String,
@@ -233,6 +236,17 @@ impl LocalHistoryQuery {
             msg_time: "0".to_string(),
             msg_seq,
             include_current: true,
+        }
+    }
+
+    /// 只读 seq=0 尾段：不带 msgId 的游标 `msgSeq=1` 只匹配 `msgSeq < 1` 的记录，
+    /// 不必先翻完全部非零序号的历史（实机复核，结果与从锚点重查一致）。
+    fn zero_seq_tail() -> Self {
+        Self {
+            msg_id: "0".to_string(),
+            msg_time: "0".to_string(),
+            msg_seq: "1".to_string(),
+            include_current: false,
         }
     }
 }
@@ -268,7 +282,8 @@ pub enum LocalHistoryIssue {
 pub enum LocalHistoryEnd {
     /// 内核返回空页或短页：本地可枚举的历史已全部读完。
     Complete,
-    /// 已回溯到请求的起始时间之前；更早的记录与 seq=0 尾段没有扫描。
+    /// 已回溯到请求的起始时间之前，更早的记录不在导出范围内；
+    /// seq=0 尾段已单独读完。
     ReachedStartTime,
     /// 分页异常终止：已抓取的记录全部保留，但完整性未核验。
     Unverified(LocalHistoryIssue),
@@ -761,7 +776,21 @@ impl BatchMessageFetcher {
             .map(to_millis);
         if let (Some(earliest), Some(start_time)) = (earliest_msg_time, filter.start_time) {
             if earliest < start_time && next_cursor.take().is_some() {
-                end = Some(LocalHistoryEnd::ReachedStartTime);
+                // 更早的非零序号记录都在范围之外，但 seq=0 的记录排在它们之后，
+                // 时间却可能落在范围内：单独读取尾段，再交给下面的时间筛选。
+                let tail = self
+                    .read_zero_seq_tail(
+                        peer,
+                        &LocalHistoryQuery::zero_seq_tail(),
+                        page_limit,
+                        None,
+                        &mut raw_messages,
+                    )
+                    .await?;
+                end = Some(match tail {
+                    LocalHistoryEnd::Complete => LocalHistoryEnd::ReachedStartTime,
+                    unverified => unverified,
+                });
             }
         }
 
@@ -942,10 +971,7 @@ impl BatchMessageFetcher {
     /// 取完 seq=0 尾段。
     ///
     /// `page` 是一张以 seq=0 结尾的满页：尾段可能还没取完，而 seq=0 的消息不能
-    /// 当游标。改为从页内最后一条非零序号的记录重查，内核会从尾段开头返回，
-    /// 条数小于 pageLimit 即证明尾段完整。尾段超过一页时逐次放大 pageLimit，
-    /// 请求数与耗时都有上限。新记录按 msgId 去重后追加到 `page`，已有记录不会
-    /// 被替换或丢弃。
+    /// 当游标。改为从页内最后一条非零序号的记录重查，内核会从尾段开头返回。
     async fn complete_zero_seq_tail(
         &self,
         peer: &Peer,
@@ -956,19 +982,42 @@ impl BatchMessageFetcher {
         let anchor_index = page
             .iter()
             .rposition(|msg| loose_msg_seq(msg).is_some_and(|seq| seq != 0));
-        let (anchor, mut limit, mut previous_count) = match anchor_index {
-            Some(index) => (
-                LocalHistoryQuery::after(&LocalHistoryCursor::from_message(&page[index])?),
-                page_limit,
-                None,
-            ),
+        match anchor_index {
+            Some(index) => {
+                let anchor =
+                    LocalHistoryQuery::after(&LocalHistoryCursor::from_message(&page[index])?);
+                self.read_zero_seq_tail(peer, &anchor, page_limit, None, page)
+                    .await
+            }
             // 整页都是 seq=0：沿用本页的请求起点，已知该起点下至少有一整页。
-            None => (
-                page_query.clone(),
-                page_limit * LOCAL_TAIL_LIMIT_GROWTH,
-                Some(page.len()),
-            ),
-        };
+            None => {
+                let known = page.len();
+                self.read_zero_seq_tail(
+                    peer,
+                    page_query,
+                    page_limit * LOCAL_TAIL_LIMIT_GROWTH,
+                    Some(known),
+                    page,
+                )
+                .await
+            }
+        }
+    }
+
+    /// 从 `anchor` 读取 seq=0 尾段并追加到 `page`。
+    ///
+    /// 返回条数小于 pageLimit 即证明尾段完整；尾段超过一页时逐次放大
+    /// pageLimit，请求数与耗时都有上限。`previous_count` 是同一起点在更小
+    /// pageLimit 下已知的返回条数。新记录按 msgId 去重后追加，已有记录不会被
+    /// 替换或丢弃。
+    async fn read_zero_seq_tail(
+        &self,
+        peer: &Peer,
+        anchor: &LocalHistoryQuery,
+        mut limit: i64,
+        mut previous_count: Option<usize>,
+        page: &mut Vec<Value>,
+    ) -> Result<LocalHistoryEnd, FetchError> {
         let mut seen: HashSet<String> = page.iter().map(message_dedupe_key).collect();
         let started = tokio::time::Instant::now();
         let budget = Duration::from_millis(LOCAL_TAIL_MAX_ELAPSED_MS);
@@ -977,7 +1026,7 @@ impl BatchMessageFetcher {
             if started.elapsed() > budget {
                 break;
             }
-            let (tail, used_limit) = match self.query_local_page(peer, &anchor, Some(limit)).await {
+            let (tail, used_limit) = match self.query_local_page(peer, anchor, Some(limit)).await {
                 Ok(tail) => tail,
                 Err(FetchError::Cancelled) => return Err(FetchError::Cancelled),
                 Err(error) => {
@@ -3475,44 +3524,6 @@ mod tests {
         assert_eq!(api.call_log().len(), 3, "不得继续读取下一轮重复历史");
     }
 
-    /// 带起始时间的导出回溯到范围之外即停止，状态与「读完全部历史」区分开。
-    #[tokio::test]
-    async fn local_history_reports_start_time_stop_separately() {
-        const BASE_MS: i64 = 1_700_000_000_000;
-        let entries: Vec<(String, i64, i64)> = (1..=13)
-            .map(|seq| (format!("m{seq}"), seq, BASE_MS + seq * 1_000_000))
-            .collect();
-        let api = Arc::new(SeqBoundaryMock::new(entries));
-        let fetcher = BatchMessageFetcher::new(
-            Arc::clone(&api) as Arc<dyn MessageFetchApi>,
-            boundary_fetcher_config(),
-        );
-        let start = BatchFetchResult {
-            has_more: true,
-            local_cursor: Some(local_cursor("m13", 1_700_013_000, 13)),
-            ..BatchFetchResult::default()
-        };
-        let filter = MessageFilter {
-            start_time: Some(BASE_MS + 6_500_000),
-            ..MessageFilter::default()
-        };
-        let mut previous = start;
-        let mut ids = Vec::new();
-        while let Some(batch) = fetcher
-            .fetch_next_batch(&group_peer(), &filter, Some(&previous))
-            .await
-            .unwrap()
-        {
-            ids.extend(batch.messages.iter().filter_map(message_msg_id));
-            previous = batch;
-        }
-        assert_eq!(ids, ["m12", "m11", "m10", "m9", "m8", "m7"]);
-        assert_eq!(
-            fetcher.local_history_end().await,
-            Some(LocalHistoryEnd::ReachedStartTime)
-        );
-    }
-
     fn local_cursor(msg_id: &str, msg_time: i64, msg_seq: i64) -> LocalHistoryCursor {
         LocalHistoryCursor {
             msg_id: msg_id.to_string(),
@@ -3891,6 +3902,55 @@ mod tests {
         let requests = api.requests();
         assert_eq!(requests.len(), 1_157 + 1);
         assert_no_zero_seq_cursor(&requests);
+    }
+
+    /// 带起始时间的导出：回溯到范围之外即停止翻页，但 seq=0 的记录排在全部
+    /// 非零序号之后，必须用合成游标单独读取，范围内的那几条才不会丢。
+    #[tokio::test(start_paused = true)]
+    async fn local_history_time_range_stop_still_reads_zero_seq_tail() {
+        const T0: i64 = 1_700_000_000;
+        let mut rows: Vec<(u64, i64, i64)> = (0..20_u64)
+            .map(|i| (1_000 + i * 10, 101 + i as i64, T0 + i as i64 * 1_000))
+            .collect();
+        // 三条 seq=0 记录：一条早于起始时间，两条落在范围内。
+        rows.push((1_045, 0, T0 + 4_500));
+        rows.push((1_155, 0, T0 + 15_500));
+        rows.push((1_185, 0, T0 + 18_500));
+        let api = Arc::new(LocalKernelMock::new(rows));
+        let fetcher = kernel_fetcher(&api, 5);
+        let filter = MessageFilter {
+            start_time: Some((T0 + 12_500) * 1_000),
+            ..MessageFilter::default()
+        };
+
+        let mut previous: Option<BatchFetchResult> = None;
+        let mut ids = Vec::new();
+        while let Some(batch) = fetcher
+            .fetch_next_batch(&group_peer(), &filter, previous.as_ref())
+            .await
+            .expect("batch")
+        {
+            ids.extend(batch.messages.iter().filter_map(message_msg_id));
+            previous = Some(batch);
+        }
+
+        // seq 120..=114 共 7 条在范围内，加上两条范围内的 seq=0 记录。
+        let expected = [
+            "1190", "1180", "1170", "1160", "1150", "1140", "1130", "1185", "1155",
+        ];
+        assert_eq!(ids, expected);
+        assert_eq!(
+            fetcher.local_history_end().await,
+            Some(LocalHistoryEnd::ReachedStartTime)
+        );
+        let requests = api.requests();
+        assert_no_zero_seq_cursor(&requests);
+        assert_eq!(requests.len(), 3, "两页常规分页 + 一次尾段查询");
+        assert_eq!(
+            requests[2],
+            ("0".to_string(), "1".to_string(), false, 5),
+            "尾段用不带 msgId 的 msgSeq=1 游标读取，不再向更早的历史翻页"
+        );
     }
 
     /// 尾段超过一页：从非零锚点重查并放大 pageLimit，直到返回短页。
