@@ -519,6 +519,37 @@ impl MessageFetchApi for NapCatBridgeClient {
             .map_err(|error| error.to_string())
     }
 
+    async fn get_local_history(
+        &self,
+        peer: &Peer,
+        msg_id: &str,
+        msg_time: &str,
+        msg_seq: &str,
+        include_current: bool,
+        count: i64,
+    ) -> Result<Value, String> {
+        self.call(
+            "MsgService.queryMsgsWithFilterEx",
+            json!([
+                msg_id,
+                msg_time,
+                msg_seq,
+                {
+                    "chatInfo": peer_to_value(peer),
+                    "filterMsgType": [],
+                    "filterSendersUid": [],
+                    "filterMsgToTime": "0",
+                    "filterMsgFromTime": "0",
+                    "isReverseOrder": false,
+                    "isIncludeCurrent": include_current,
+                    "pageLimit": count
+                }
+            ]),
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
+
     async fn bridge_healthy(&self) -> bool {
         self.healthy().await
     }

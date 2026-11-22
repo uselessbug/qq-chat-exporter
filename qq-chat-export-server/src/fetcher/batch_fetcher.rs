@@ -162,6 +162,14 @@ impl Default for BatchFetchConfig {
     }
 }
 
+/// 本地历史查询接口使用的精确分页游标。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalHistoryCursor {
+    msg_id: String,
+    msg_time: String,
+    msg_seq: String,
+}
+
 /// 批量获取结果。
 #[derive(Debug, Clone, Default)]
 pub struct BatchFetchResult {
@@ -173,6 +181,8 @@ pub struct BatchFetchResult {
     pub next_message_id: Option<String>,
     /// 下一批起始序列号。
     pub next_seq: Option<String>,
+    /// 本地数据库分页游标；仅 queryMsgsWithFilterEx 回退模式使用。
+    pub local_cursor: Option<LocalHistoryCursor>,
     /// 客户端筛选后的实际条数。
     pub actual_count: usize,
     /// 本次获取耗时（毫秒）。
@@ -261,6 +271,12 @@ impl FetchError {
         }
     }
 
+    /// 2004010 表示当前账号已非群成员；继续重试同一原生接口没有意义。
+    fn is_not_group_member(&self) -> bool {
+        matches!(self, Self::Api(message) if
+            message.contains("2004010") || message.contains("is not group member"))
+    }
+
     /// issue #723：判断是否是 QQ Worker 内部重试耗尽。
     ///
     /// NapCat 原生查询返回 `GeneralCallResult.result = -1`，且 `errMsg` 为
@@ -330,6 +346,19 @@ pub trait MessageFetchApi: Send + Sync {
         anchor_seq: i64,
         count: i64,
     ) -> Result<Value, String>;
+
+    /// QQ NT 本地数据库分页查询；默认实现供旧 mock 保持兼容。
+    async fn get_local_history(
+        &self,
+        _peer: &Peer,
+        _msg_id: &str,
+        _msg_time: &str,
+        _msg_seq: &str,
+        _include_current: bool,
+        _count: i64,
+    ) -> Result<Value, String> {
+        Err("本地消息查询接口不可用".to_string())
+    }
 
     /// bridge / Worker 是否健康可用（默认视为健康）。
     async fn bridge_healthy(&self) -> bool {
@@ -507,14 +536,31 @@ impl BatchMessageFetcher {
         let (next_message_id, next_seq) = previous.map_or((None, None), |prev| {
             (prev.next_message_id.clone(), prev.next_seq.clone())
         });
-        let result = self
-            .fetch_messages(
-                peer,
-                filter,
-                next_message_id.as_deref(),
-                next_seq.as_deref(),
-            )
-            .await?;
+        // 一旦触发 2004010，后续页始终使用本地游标，不再反复查询被拒绝的原生接口。
+        let result = if peer.chat_type == 2
+            && previous.is_some_and(|batch| batch.local_cursor.is_some())
+        {
+            self.fetch_local_group_page(peer, filter, previous).await?
+        } else {
+            match self
+                .fetch_messages(
+                    peer,
+                    filter,
+                    next_message_id.as_deref(),
+                    next_seq.as_deref(),
+                )
+                .await
+            {
+                Ok(batch) => batch,
+                Err(error) if peer.chat_type == 2 && error.is_not_group_member() => {
+                    tracing::warn!(
+                        "[BatchMessageFetcher] 2004010 (is not group member)，改用本地数据库分页继续导出"
+                    );
+                    self.fetch_local_group_page(peer, filter, previous).await?
+                }
+                Err(error) => return Err(error),
+            }
+        };
 
         // 防御性提前停止：客户端筛选后为空且批次最早时间早于开始时间，无需继续回溯。
         if result.messages.is_empty() {
@@ -530,6 +576,124 @@ impl BatchMessageFetcher {
             }
         }
         Ok(Some(result))
+    }
+
+    /// 已退群/封禁群的本地消息分页。原生页完成后使用 next_seq 衔接，
+    /// 此后使用 (msgId,msgTime,msgSeq) 精确游标，避免同 seq 记录丢失。
+    async fn fetch_local_group_page(
+        &self,
+        peer: &Peer,
+        filter: &MessageFilter,
+        previous: Option<&BatchFetchResult>,
+    ) -> Result<BatchFetchResult, FetchError> {
+        let previous_cursor = previous.and_then(|batch| batch.local_cursor.clone());
+        let (msg_id, msg_time, msg_seq, include_current) = match &previous_cursor {
+            Some(cursor) => (
+                cursor.msg_id.clone(),
+                cursor.msg_time.clone(),
+                cursor.msg_seq.clone(),
+                false,
+            ),
+            None => (
+                "0".to_string(),
+                "0".to_string(),
+                previous
+                    .and_then(|batch| batch.next_seq.clone())
+                    .unwrap_or_else(|| "0".to_string()),
+                true,
+            ),
+        };
+
+        let started = now_ms();
+        let api = Arc::clone(&self.api);
+        let peer = peer.clone();
+        let raw_messages = self
+            .call_with_retry(move |batch_size| {
+                let api = Arc::clone(&api);
+                let peer = peer.clone();
+                let msg_id = msg_id.clone();
+                let msg_time = msg_time.clone();
+                let msg_seq = msg_seq.clone();
+                async move {
+                    let value = api
+                        .get_local_history(
+                            &peer,
+                            &msg_id,
+                            &msg_time,
+                            &msg_seq,
+                            include_current,
+                            seq_page_size(batch_size),
+                        )
+                        .await?;
+                    if is_history_exhausted_result(&value) {
+                        Ok(Vec::new())
+                    } else {
+                        extract_msg_page_strict(&value)
+                    }
+                }
+            })
+            .await?;
+
+        // 必须从原始消息取游标，不能从筛选后的消息取（否则会跳过记录）。
+        let earliest_msg_time = raw_messages
+            .iter()
+            .filter_map(loose_msg_time)
+            .min()
+            .map(to_millis);
+        let cursor = raw_messages
+            .last()
+            .map(|last| {
+                Ok(LocalHistoryCursor {
+                    msg_id: message_msg_id(last)
+                        .ok_or_else(|| FetchError::Api("本地消息缺少 msgId".to_string()))?,
+                    msg_time: loose_msg_time(last)
+                        .ok_or_else(|| FetchError::Api("本地消息缺少 msgTime".to_string()))?
+                        .to_string(),
+                    msg_seq: loose_msg_seq(last)
+                        .ok_or_else(|| FetchError::Api("本地消息缺少 msgSeq".to_string()))?
+                        .to_string(),
+                })
+            })
+            .transpose()?;
+
+        if let (Some(previous), Some(current)) = (&previous_cursor, &cursor) {
+            let previous_seq = previous.msg_seq.parse::<i64>().unwrap_or(i64::MAX);
+            let current_seq = current.msg_seq.parse::<i64>().unwrap_or(i64::MAX);
+            if current == previous
+                || current_seq > previous_seq
+                || raw_messages.iter().any(|msg| {
+                    message_msg_id(msg).as_deref() == Some(previous.msg_id.as_str())
+                })
+            {
+                return Err(FetchError::Api(
+                    "本地历史分页游标未前进或返回重复边界消息，已中止以避免遗漏".to_string(),
+                ));
+            }
+        }
+
+        let mut has_more = cursor.is_some();
+        if let (Some(earliest), Some(start_time)) = (earliest_msg_time, filter.start_time) {
+            if earliest < start_time {
+                has_more = false;
+            }
+        }
+        let cursor = has_more.then_some(cursor).flatten();
+        let messages = apply_client_side_filter(raw_messages, filter);
+        let actual_count = messages.len();
+        tracing::info!(
+            "[BatchMessageFetcher] 本地历史查询获取 {actual_count} 条消息, nextSeq={:?}, hasMore={has_more}",
+            cursor.as_ref().map(|c| &c.msg_seq)
+        );
+        Ok(BatchFetchResult {
+            messages,
+            has_more,
+            next_message_id: cursor.as_ref().map(|c| c.msg_id.clone()),
+            next_seq: cursor.as_ref().map(|c| c.msg_seq.clone()),
+            local_cursor: cursor,
+            actual_count,
+            fetch_time_ms: now_ms() - started,
+            earliest_msg_time,
+        })
     }
 
     /// 根据筛选条件和性能情况选择最优的获取策略。
@@ -1045,6 +1209,10 @@ impl BatchMessageFetcher {
                 state.stats.consecutive_failures += 1;
             }
 
+            if result.is_not_group_member() {
+                return Err(result);
+            }
+
             // issue #634：bridge / Worker 崩溃属于可恢复状态：等待 NapCat 重启
             // 并重新登录后从当前游标继续，不计入普通重试次数。
             if result.is_bridge_down() {
@@ -1504,6 +1672,7 @@ fn process_seq_page_messages(
         has_more,
         next_message_id: None,
         next_seq,
+        local_cursor: None,
         actual_count,
         fetch_time_ms: 0,
         earliest_msg_time,
@@ -1588,6 +1757,7 @@ fn process_api_result(
         has_more,
         next_message_id,
         next_seq,
+        local_cursor: None,
         actual_count,
         fetch_time_ms: 0,
         earliest_msg_time,
@@ -2412,6 +2582,40 @@ mod tests {
             Ok(json!({ "result": 0, "msgList": [] }))
         }
 
+        async fn get_local_history(
+            &self,
+            _peer: &Peer,
+            msg_id: &str,
+            _msg_time: &str,
+            msg_seq: &str,
+            include_current: bool,
+            count: i64,
+        ) -> Result<Value, String> {
+            self.calls.lock().unwrap().push(format!(
+                "local:{msg_id}:{msg_seq}:{include_current}:{count}"
+            ));
+            let start = if msg_id != "0" {
+                let pos = *self.positions.get(msg_id).ok_or("unknown local msgId")?;
+                pos + usize::from(!include_current)
+            } else if msg_seq == "0" {
+                0
+            } else {
+                self.records
+                    .iter()
+                    .position(|msg| loose_msg_seq(msg).is_some_and(|seq| {
+                        seq <= msg_seq.parse::<i64>().unwrap_or(0)
+                    }))
+                    .unwrap_or(self.records.len())
+            };
+            let messages: Vec<Value> = self.records
+                .iter()
+                .skip(start)
+                .take(count.max(0) as usize)
+                .cloned()
+                .collect();
+            Ok(json!({ "result": 0, "msgList": messages }))
+        }
+
         async fn get_msgs_by_seq_and_count(
             &self,
             _peer: &Peer,
@@ -2782,4 +2986,66 @@ mod tests {
             api.call_log()
         );
     }
+    /// 中途退群后原生接口返回 2004010，接续当前序列页而非重头导出。
+    #[tokio::test]
+    async fn local_history_fallback_resumes_after_membership_error() {
+        let entries: Vec<(String, i64, i64)> = (1..=12)
+            .map(|seq| (format!("m{seq}"), seq, seq * 1_000))
+            .collect();
+        let api = Arc::new(SeqBoundaryMock::new(entries));
+        api.script_seq(Ok(json!({
+            "result": 2004010,
+            "errMsg": "is not group member"
+        })));
+        let fetcher = BatchMessageFetcher::new(
+            Arc::clone(&api) as Arc<dyn MessageFetchApi>,
+            boundary_fetcher_config(),
+        );
+        // 先前原生分页已提交 seq 12..8；下一批应从 seq=7 开始。
+        let mut previous = BatchFetchResult {
+            has_more: true,
+            next_seq: Some("7".to_string()),
+            ..BatchFetchResult::default()
+        };
+        let mut ids = Vec::new();
+        for _ in 0..5 {
+            let Some(batch) = fetcher
+                .fetch_next_batch(&group_peer(), &MessageFilter::default(), Some(&previous))
+                .await
+                .expect("2004010 应进入本地分页") else {
+                    break;
+                };
+            ids.extend(batch.messages.iter().filter_map(message_msg_id));
+            previous = batch;
+        }
+        let expected: Vec<String> = (1..=7).rev().map(|seq| format!("m{seq}")).collect();
+        assert_eq!(ids, expected);
+        let calls = api.call_log();
+        assert_eq!(calls.iter().filter(|call| call.starts_with("seq:")).count(), 1);
+        assert!(calls.iter().any(|call| call == "local:0:7:true:5"));
+        assert!(calls.iter().any(|call| call == "local:m3:3:false:5"));
+    }
+
+    /// 即使 #716 边界补读遭到 2004010，仍能从本地库读取完整记录。
+    #[tokio::test]
+    async fn local_history_fallback_handles_boundary_query_error() {
+        let entries: Vec<(String, i64, i64)> = (1..=9)
+            .map(|seq| (format!("m{seq}"), seq, seq * 1_000))
+            .collect();
+        let api = Arc::new(SeqBoundaryMock::new(entries));
+        // 首次原生最新消息正常；接着边界补读失败。
+        api.script_seq(Ok(json!({
+            "result": 2004010,
+            "errMsg": "is not group member"
+        })));
+        let fetcher = BatchMessageFetcher::new(
+            Arc::clone(&api) as Arc<dyn MessageFetchApi>,
+            boundary_fetcher_config(),
+        );
+        let ids = collect_all_ids(&fetcher, &group_peer(), &MessageFilter::default()).await;
+        let expected: Vec<String> = (1..=9).rev().map(|seq| format!("m{seq}")).collect();
+        assert_eq!(ids, expected);
+        assert!(api.call_log().iter().any(|call| call == "local:0:0:true:5"));
+    }
+
 }
