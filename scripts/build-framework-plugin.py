@@ -260,7 +260,7 @@ def main():
     
     # Download NapCat.Framework
     print("[2/8] Downloading NapCat.Framework...")
-    framework_url = f"https://github.com/NapNeko/NapCatQQ/releases/download/{napcat_version}/NapCat.Framework.zip"
+    framework_url = f"https://github.com/XingYunStar/NapCatQQ/releases/download/{napcat_version}/NapCat.Framework.zip"
     try:
         download_file(framework_url, "NapCat.Framework.zip")
     except Exception as e:

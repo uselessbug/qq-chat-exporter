@@ -16,7 +16,7 @@ from urllib.request import Request, urlopen
 
 SERVER_DIR = Path("qq-chat-export-server")
 
-NAPCAT_LATEST_API = "https://api.github.com/repos/NapNeko/NapCatQQ/releases/latest"
+NAPCAT_LATEST_API = "https://api.github.com/repos/XingYunStar/NapCatQQ/releases/latest"
 
 
 def _rate_limit_hint(headers) -> str:

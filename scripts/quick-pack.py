@@ -155,7 +155,7 @@ def main():
     
     # Get NapCat version
     napcat_version = get_napcat_latest_version("[1/11]")
-    napcat_url = f"https://github.com/NapNeko/NapCatQQ/releases/download/{napcat_version}/NapCat.Shell.zip"
+    napcat_url = f"https://github.com/XingYunStar/NapCatQQ/releases/download/{napcat_version}/NapCat.Shell.zip"
     print()
     
     # Clean old files
