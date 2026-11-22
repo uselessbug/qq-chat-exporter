@@ -604,8 +604,18 @@ impl BatchMessageFetcher {
             ),
         };
 
+        // 诊断只记录会话标识和分页游标，不输出消息正文或 elements。
+        tracing::info!(
+            "[QCE-LOCAL-HISTORY] request peer={} msgId={} msgTime={} msgSeq={} includeCurrent={}",
+            peer.peer_uid,
+            msg_id,
+            msg_time,
+            msg_seq,
+            include_current
+        );
         let started = now_ms();
         let api = Arc::clone(&self.api);
+        let peer_uid = peer.peer_uid.clone();
         let peer = peer.clone();
         let raw_messages = self
             .call_with_retry(move |batch_size| {
@@ -656,18 +666,76 @@ impl BatchMessageFetcher {
             })
             .transpose()?;
 
+        // 简短分页摘要；在默认 info 日志级别可直接看到异常前一页。
+        let first = raw_messages.first();
+        let last = raw_messages.last();
+        tracing::info!(
+            "[QCE-LOCAL-HISTORY] response count={} firstSeq={:?} firstTime={:?} lastSeq={:?} lastTime={:?}",
+            raw_messages.len(),
+            first.and_then(loose_msg_seq),
+            first.and_then(loose_msg_time),
+            last.and_then(loose_msg_seq),
+            last.and_then(loose_msg_time),
+        );
+
         if let (Some(previous), Some(current)) = (&previous_cursor, &cursor) {
             let previous_seq = previous.msg_seq.parse::<i64>().unwrap_or(i64::MAX);
             let current_seq = current.msg_seq.parse::<i64>().unwrap_or(i64::MAX);
-            if current == previous
-                || current_seq > previous_seq
-                || raw_messages.iter().any(|msg| {
-                    message_msg_id(msg).as_deref() == Some(previous.msg_id.as_str())
+            let previous_time = previous.msg_time.parse::<i64>().ok();
+            let current_time = current.msg_time.parse::<i64>().ok();
+            let unchanged_cursor = current == previous;
+            let seq_increased = current_seq > previous_seq;
+            let repeated_positions: Vec<usize> = raw_messages
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, msg)| {
+                    (message_msg_id(msg).as_deref() == Some(previous.msg_id.as_str()))
+                        .then_some(idx)
                 })
-            {
-                return Err(FetchError::Api(
-                    "本地历史分页游标未前进或返回重复边界消息，已中止以避免遗漏".to_string(),
-                ));
+                .collect();
+            let repeated_previous_id = !repeated_positions.is_empty();
+            // 统计页内是否出现序号逆向跳变；这不改变既有校验逻辑。
+            let seq_order_increases = raw_messages
+                .windows(2)
+                .filter(|pair| match (loose_msg_seq(&pair[0]), loose_msg_seq(&pair[1])) {
+                    (Some(a), Some(b)) => b > a,
+                    _ => false,
+                })
+                .count();
+            if unchanged_cursor || seq_increased || repeated_previous_id {
+                tracing::warn!(
+                    "[QCE-LOCAL-HISTORY] cursor_anomaly peer={} prevId={} prevTime={} prevSeq={} nextId={} nextTime={} nextSeq={} firstId={:?} firstSeq={:?} firstTime={:?} lastId={:?} lastSeq={:?} lastTime={:?} count={} unchangedCursor={} seqIncreased={} repeatedPreviousId={} repeatedPositions={:?} seqOrderIncreases={} prevTimeParsed={:?} nextTimeParsed={:?}",
+                    peer_uid,
+                    previous.msg_id,
+                    previous.msg_time,
+                    previous.msg_seq,
+                    current.msg_id,
+                    current.msg_time,
+                    current.msg_seq,
+                    first.and_then(message_msg_id),
+                    first.and_then(loose_msg_seq),
+                    first.and_then(loose_msg_time),
+                    last.and_then(message_msg_id),
+                    last.and_then(loose_msg_seq),
+                    last.and_then(loose_msg_time),
+                    raw_messages.len(),
+                    unchanged_cursor,
+                    seq_increased,
+                    repeated_previous_id,
+                    repeated_positions,
+                    seq_order_increases,
+                    previous_time,
+                    current_time,
+                );
+                // 错误本身也带上最小诊断字段，方便仅凭任务 UI 截图定位。
+                return Err(FetchError::Api(format!(
+                    "本地历史分页游标异常：unchangedCursor={unchanged_cursor}, seqIncreased={seq_increased}, repeatedPreviousId={repeated_previous_id}, repeatedPositions={repeated_positions:?}, prevSeq={}, nextSeq={}, prevTime={}, nextTime={}, count={}；详细字段请查看 qce-server.log",
+                    previous.msg_seq,
+                    current.msg_seq,
+                    previous.msg_time,
+                    current.msg_time,
+                    raw_messages.len()
+                )));
             }
         }
 
